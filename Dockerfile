@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.23
-FROM python:3.13-slim AS builder
+FROM python:3.14-slim AS builder
 
 ENV PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
@@ -15,7 +15,7 @@ RUN uv venv /opt/venv \
  && . /opt/venv/bin/activate \
  && uv pip install --no-cache .
 
-FROM python:3.13-slim
+FROM python:3.14-slim
 
 ENV PATH="/opt/venv/bin:${PATH}" \
     PYTHONUNBUFFERED=1 \
