@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Daily compactor that merges 24 hourly Parquet files per stream into one daily file in the nats-archive bucket on RustFS"
 readme = "README.md"
 license = "GPL-2.0-or-later"
-requires-python = ">=3.13"
+requires-python = ">=3.14.4"
 authors = [
     { name = "Alexander Zimmermann" },
 ]
@@ -16,7 +16,7 @@ classifiers = [
     "Topic :: System :: Archiving",
 ]
 dependencies = [
-    "pyarrow>=18.1.0",
+    "pyarrow>=24.0.0",
     "structlog>=25.5.0",
 ]
 
