@@ -49,3 +49,30 @@ select = ["E", "F", "I", "B", "UP"]
 [tool.mypy]
 python_version = "3.13"
 strict = true
+
+[[tool.mypy.overrides]]
+# pyarrow ships partial stubs — `pyarrow.fs.S3FileSystem`, `FileSelector`,
+# `FileType`, and the read_table/write_table functions are missing or
+# untyped in the upstream stubs.
+module = ["pyarrow", "pyarrow.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["nats_archive_compactor.__main__"]
+disable_error_code = ["name-defined", "attr-defined", "no-untyped-call"]
+
+# Pylance/Pyright counterparts — quiet the same pyarrow stub gaps.
+[tool.pyright]
+include = ["src", "tests"]
+venvPath = "."
+venv = ".venv"
+reportUnknownMemberType = "none"
+reportUnknownArgumentType = "none"
+reportUnknownVariableType = "none"
+reportAttributeAccessIssue = "none"
+reportUnnecessaryIsInstance = "none"
+reportUnnecessaryComparison = "none"
+
+[[tool.pyright.executionEnvironments]]
+root = "tests"
+reportPrivateUsage = "none"
