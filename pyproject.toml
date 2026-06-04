@@ -4,7 +4,7 @@ version = "0.2.0"
 description = "Daily compactor that merges 24 hourly Parquet files per stream into one daily file in the nats-archive bucket on RustFS"
 readme = "README.md"
 license = "GPL-2.0-or-later"
-requires-python = ">=3.14.4"
+requires-python = ">=3.14.5"
 authors = [
     { name = "Alexander Zimmermann" },
 ]
@@ -24,7 +24,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=9.0.3",
-    "ruff>=0.15.12",
+    "ruff>=0.15.16",
     "mypy>=2.0.0",
     "pre-commit>=4.6.0",
 ]
