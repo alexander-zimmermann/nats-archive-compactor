@@ -1,6 +1,6 @@
 [project]
 name = "nats-archive-compactor"
-version = "0.2.0"
+version = "0.3.0"
 description = "Daily compactor that merges 24 hourly Parquet files per stream into one daily file in the nats-archive bucket on RustFS"
 readme = "README.md"
 license = "GPL-2.0-or-later"
