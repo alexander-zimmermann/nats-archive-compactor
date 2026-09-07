@@ -269,7 +269,7 @@ requires-dist = [
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=4.6.2" },
     { name = "pyarrow", specifier = ">=25.0.1" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.1.1" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.16.5" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.16.6" },
     { name = "structlog", specifier = ">=26.1.0" },
     { name = "tenacity", specifier = ">=9.1.4" },
 ]
