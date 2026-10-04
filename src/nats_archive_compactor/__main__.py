@@ -16,17 +16,6 @@ from tenacity import (
     wait_exponential,
 )
 
-STREAMS = (
-    "knx",
-    "ems_esp",
-    "solaredge_inverter",
-    "solaredge_powerflow",
-    "warp_system",
-    "warp_evse",
-    "warp_charge_manager",
-    "warp_charge_tracker",
-    "warp_meter",
-)
 BUCKET = "nats-archive"
 
 DEFAULT_REQUEST_TIMEOUT = 60.0
@@ -58,15 +47,60 @@ def _build_s3() -> fs.S3FileSystem:
     )
 
 
-def _resolve_streams() -> tuple[str, ...]:
+@_retry
+def _subdirs(s3: fs.S3FileSystem, prefix: str) -> list[str]:
+    """Return the names of the directories directly under `prefix`, sorted."""
+    selector = fs.FileSelector(prefix, recursive=False, allow_not_found=True)
+    return sorted(
+        entry.path.rsplit("/", 1)[-1]
+        for entry in s3.get_file_info(selector)
+        if entry.type == fs.FileType.Directory
+    )
+
+
+def _resolve_streams(s3: fs.S3FileSystem) -> tuple[str, ...]:
+    """Streams are the top-level prefixes in the bucket, or an explicit override.
+
+    Discovering them means a stream added by a new sidecar is compacted without a
+    code change; a hardcoded list silently skipped seven of them for months.
+    """
     raw = os.environ.get("COMPACT_STREAMS", "").strip()
-    if not raw:
-        return STREAMS
-    requested = tuple(s.strip() for s in raw.split(",") if s.strip())
-    unknown = [s for s in requested if s not in STREAMS]
-    if unknown:
-        raise ValueError(f"Unknown streams in COMPACT_STREAMS: {unknown}")
-    return requested
+    if raw:
+        return tuple(s.strip() for s in raw.split(",") if s.strip())
+    return tuple(_subdirs(s3, BUCKET))
+
+
+def _stream_days(s3: fs.S3FileSystem, stream: str) -> list[str]:
+    """Return every YYYY/MM/DD prefix present for a stream, newest first."""
+    base = f"{BUCKET}/{stream}"
+    days: list[str] = []
+    for year in _subdirs(s3, base):
+        for month in _subdirs(s3, f"{base}/{year}"):
+            days.extend(f"{year}/{month}/{day}" for day in _subdirs(s3, f"{base}/{year}/{month}"))
+    return sorted(days, reverse=True)
+
+
+@_retry
+def _is_compacted(s3: fs.S3FileSystem, stream: str, day: str) -> bool:
+    info = s3.get_file_info(f"{BUCKET}/{stream}/{day}/daily.parquet")
+    return bool(info.type == fs.FileType.File)
+
+
+def _pending_days(s3: fs.S3FileSystem, stream: str, today: str, limit: int) -> list[str]:
+    """Up to `limit` days for this stream that still have no daily.parquet, newest first.
+
+    Today is skipped because its hours are still being written. Walking newest-first
+    stops after `limit` hits, so an already-compacted stream costs a handful of probes.
+    """
+    pending: list[str] = []
+    for day in _stream_days(s3, stream):
+        if day >= today:
+            continue
+        if not _is_compacted(s3, stream, day):
+            pending.append(day)
+            if len(pending) >= limit:
+                break
+    return pending
 
 
 @_retry
@@ -81,11 +115,7 @@ def _list_hour_parquets(s3: fs.S3FileSystem, day_prefix: str) -> list[str]:
     for hh in range(24):
         prefix = f"{day_prefix}/{hh:02d}"
         selector = fs.FileSelector(prefix, recursive=False, allow_not_found=True)
-        sources.extend(
-            f.path
-            for f in s3.get_file_info(selector)
-            if f.path.endswith(".parquet")
-        )
+        sources.extend(f.path for f in s3.get_file_info(selector) if f.path.endswith(".parquet"))
     return sources
 
 
@@ -124,6 +154,13 @@ def _compact(s3: fs.S3FileSystem, stream: str, day: str) -> str:
     return "compacted"
 
 
+def _targets(s3: fs.S3FileSystem, stream: str, day: str, today: str, backfill: int) -> list[str]:
+    """The days to compact for this stream: the single day, or a bounded backfill."""
+    if backfill <= 0:
+        return [day]
+    return _pending_days(s3, stream, today, backfill)
+
+
 def main() -> None:
     structlog.configure(
         processors=[
@@ -133,26 +170,48 @@ def main() -> None:
         ]
     )
 
-    yesterday = dt.datetime.now(dt.UTC).date() - dt.timedelta(days=1)
-    day = os.environ.get("COMPACT_DAY") or yesterday.strftime("%Y/%m/%d")
-    streams = _resolve_streams()
-    log.info("compaction.start", day=day, streams=list(streams))
+    now = dt.datetime.now(dt.UTC).date()
+    today = now.strftime("%Y/%m/%d")
+    explicit_day = os.environ.get("COMPACT_DAY")
+    day = explicit_day or (now - dt.timedelta(days=1)).strftime("%Y/%m/%d")
+    # An explicit day names exactly one target, so backfill only applies without it.
+    backfill = 0 if explicit_day else int(os.environ.get("COMPACT_BACKFILL_DAYS", "0"))
 
     s3 = _build_s3()
+    streams = _resolve_streams(s3)
+    log.info("compaction.start", day=day, backfill_days=backfill, streams=list(streams))
+
     failed: list[str] = []
+    compacted = 0
 
     for stream in streams:
         try:
-            status = _compact(s3, stream, day)
-            log.info("compaction.stream", stream=stream, status=status)
+            targets = _targets(s3, stream, day, today, backfill)
         except Exception as exc:  # pyarrow raises a wide net of OSError-likes
-            log.error("compaction.stream", stream=stream, status="failed", error=str(exc))
+            log.error("compaction.stream", stream=stream, status="list-failed", error=str(exc))
             failed.append(stream)
+            continue
+
+        for target in targets:
+            try:
+                status = _compact(s3, stream, target)
+                if status == "compacted":
+                    compacted += 1
+                log.info("compaction.stream", stream=stream, day=target, status=status)
+            except Exception as exc:
+                log.error(
+                    "compaction.stream",
+                    stream=stream,
+                    day=target,
+                    status="failed",
+                    error=str(exc),
+                )
+                failed.append(f"{stream}@{target}")
 
     if failed:
-        log.warning("compaction.done", day=day, failed=failed)
+        log.warning("compaction.done", day=day, compacted=compacted, failed=failed)
         sys.exit(1)
-    log.info("compaction.done", day=day)
+    log.info("compaction.done", day=day, compacted=compacted)
 
 
 if __name__ == "__main__":
