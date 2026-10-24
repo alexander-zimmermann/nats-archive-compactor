@@ -10,8 +10,10 @@
   "python.testing.pytestArgs": ["tests"],
 
   // Pin Mypy to the project venv so dev-deps are visible.
-  "mypy-type-checker.interpreter": ["${workspaceFolder}/.venv/bin/python"],
+  "mypy-type-checker.path": ["${workspaceFolder}/.venv/bin/dmypy"],
   "mypy-type-checker.importStrategy": "fromEnvironment",
+  // The extension's own server crashes on Python 3.15 (microsoft/vscode-mypy#635).
+  "mypy-type-checker.interpreter": ["${userHome}/.local/bin/python3.14"],
 
   "[python]": {
     "editor.defaultFormatter": "charliermarsh.ruff",
