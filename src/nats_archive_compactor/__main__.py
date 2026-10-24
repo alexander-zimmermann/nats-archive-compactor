@@ -129,6 +129,27 @@ def _write_daily(s3: fs.S3FileSystem, table: pa.Table, daily: str) -> None:
     pq.write_table(table, daily, filesystem=s3, compression="zstd")
 
 
+@_retry
+def _delete_one(s3: fs.S3FileSystem, key: str) -> None:
+    s3.delete_file(key)
+
+
+def _delete_merged(s3: fs.S3FileSystem, sources: list[str]) -> None:
+    """Delete exactly the hour files that went into the daily file.
+
+    Deleting the hour directories instead removes whatever was written after the
+    listing, and pyarrow re-asserts the day prefix as an empty object once its last
+    child is gone, which left one empty marker per compacted day (lares#2522). S3
+    has no directories, so a prefix disappears with its last key.
+    """
+    for key in sources:
+        try:
+            _delete_one(s3, key)
+        except FileNotFoundError:
+            # A retried batch re-deletes keys the previous attempt already removed.
+            continue
+
+
 def _compact(s3: fs.S3FileSystem, stream: str, day: str) -> str:
     """Merge stream's hour-files for `day` into one daily.parquet. Return status string."""
     day_prefix = f"{BUCKET}/{stream}/{day}"
@@ -147,9 +168,7 @@ def _compact(s3: fs.S3FileSystem, stream: str, day: str) -> str:
     if s3.get_file_info(daily).type != fs.FileType.File:
         raise RuntimeError("daily.parquet missing after write")
 
-    for entry in s3.get_file_info(fs.FileSelector(day_prefix)):
-        if entry.type == fs.FileType.Directory:
-            s3.delete_dir(entry.path)
+    _delete_merged(s3, sources)
 
     return "compacted"
 
