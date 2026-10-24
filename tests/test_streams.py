@@ -6,6 +6,7 @@ import pyarrow.fs as fs
 import pytest
 
 from nats_archive_compactor.__main__ import (
+    _delete_merged,
     _pending_days,
     _resolve_streams,
     _stream_days,
@@ -28,6 +29,16 @@ class FakeS3:
 
     def __init__(self, keys: set[str]) -> None:
         self.keys = keys
+        self.deleted_files: list[str] = []
+
+    def delete_file(self, key: str) -> None:
+        if key not in self.keys:
+            raise FileNotFoundError(key)
+        self.keys.discard(key)
+        self.deleted_files.append(key)
+
+    def delete_dir(self, path: str) -> None:
+        raise AssertionError(f"compaction must not delete directories, got {path}")
 
     def get_file_info(self, arg: str | fs.FileSelector) -> _Info | list[_Info]:
         if isinstance(arg, str):
@@ -113,3 +124,35 @@ def test_targets_with_backfill_returns_pending_days() -> None:
         "2026/09/30",
         "2026/09/29",
     ]
+
+
+def test_only_the_merged_keys_are_deleted() -> None:
+    """The delete follows what was merged, not a fresh listing of the day."""
+    s3 = FakeS3(
+        _keys(
+            "knx/2026/10/18/07/a.parquet",
+            "knx/2026/10/18/08/b.parquet",
+            "knx/2026/10/18/daily.parquet",
+            "knx/2026/10/19/07/c.parquet",
+        )
+    )
+    merged = sorted(_keys("knx/2026/10/18/07/a.parquet", "knx/2026/10/18/08/b.parquet"))
+
+    _delete_merged(s3, merged)
+
+    assert sorted(s3.deleted_files) == merged
+    # The daily file and an unrelated day survive; a late write would too, because it
+    # was never in `merged`.
+    assert s3.keys == _keys("knx/2026/10/18/daily.parquet", "knx/2026/10/19/07/c.parquet")
+
+
+def test_a_key_already_gone_does_not_stop_the_rest() -> None:
+    """A retried batch re-deletes keys the previous attempt removed."""
+    s3 = FakeS3(_keys("knx/2026/10/18/08/b.parquet"))
+    missing = next(iter(_keys("knx/2026/10/18/07/a.parquet")))
+    present = next(iter(_keys("knx/2026/10/18/08/b.parquet")))
+
+    _delete_merged(s3, [missing, present])
+
+    assert s3.deleted_files == [present]
+    assert s3.keys == set()
