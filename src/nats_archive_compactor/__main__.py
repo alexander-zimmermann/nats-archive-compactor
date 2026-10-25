@@ -1,64 +1,84 @@
 from __future__ import annotations
 
 import datetime as dt
+import io
 import os
+import re
 import sys
+import tempfile
+from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
+import boto3
 import pyarrow as pa
-import pyarrow.fs as fs
 import pyarrow.parquet as pq
 import structlog
-from tenacity import (
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
+from botocore.config import Config
+from botocore.exceptions import ClientError
+
+if TYPE_CHECKING:
+    from mypy_boto3_s3 import S3Client
 
 BUCKET = "nats-archive"
 
 DEFAULT_REQUEST_TIMEOUT = 60.0
 DEFAULT_CONNECT_TIMEOUT = 10.0
 RETRY_ATTEMPTS = 3
-RETRY_WAIT_MIN = 2
-RETRY_WAIT_MAX = 16
+DELETE_BATCH = 1000  # the most keys one DeleteObjects call takes
+
+_HOUR_FILE = re.compile(r"\d{2}/[^/]+\.parquet")
 
 log = structlog.get_logger()
 
-_retry = retry(
-    reraise=True,
-    stop=stop_after_attempt(RETRY_ATTEMPTS),
-    wait=wait_exponential(multiplier=1, min=RETRY_WAIT_MIN, max=RETRY_WAIT_MAX),
-    retry=retry_if_exception_type(OSError),
-)
 
-
-def _build_s3() -> fs.S3FileSystem:
+def _build_client() -> S3Client:
+    """An S3 client on plain keys, so a prefix disappears with its last key."""
     url = urlparse(os.environ["RUSTFS_URL"])
-    return fs.S3FileSystem(
-        endpoint_override=f"{url.hostname}:{url.port or 9000}",
-        scheme=url.scheme,
-        access_key=os.environ["ACCESS_KEY"],
-        secret_key=os.environ["SECRET_KEY"],
-        force_virtual_addressing=False,
-        request_timeout=float(os.environ.get("S3_REQUEST_TIMEOUT", DEFAULT_REQUEST_TIMEOUT)),
-        connect_timeout=float(os.environ.get("S3_CONNECT_TIMEOUT", DEFAULT_CONNECT_TIMEOUT)),
+    return boto3.client(
+        "s3",
+        endpoint_url=f"{url.scheme}://{url.hostname}:{url.port or 9000}",
+        aws_access_key_id=os.environ["ACCESS_KEY"],
+        aws_secret_access_key=os.environ["SECRET_KEY"],
+        region_name="us-east-1",
+        config=Config(
+            s3={"addressing_style": "path"},
+            connect_timeout=float(os.environ.get("S3_CONNECT_TIMEOUT", DEFAULT_CONNECT_TIMEOUT)),
+            read_timeout=float(os.environ.get("S3_REQUEST_TIMEOUT", DEFAULT_REQUEST_TIMEOUT)),
+            retries={"total_max_attempts": RETRY_ATTEMPTS, "mode": "standard"},
+        ),
     )
 
 
-@_retry
-def _subdirs(s3: fs.S3FileSystem, prefix: str) -> list[str]:
-    """Return the names of the directories directly under `prefix`, sorted."""
-    selector = fs.FileSelector(prefix, recursive=False, allow_not_found=True)
+def _subdirs(client: S3Client, prefix: str) -> list[str]:
+    """Return the names of the prefixes directly under `prefix` ("" is the bucket), sorted."""
+    base = f"{prefix}/" if prefix else ""
+    pages = client.get_paginator("list_objects_v2").paginate(
+        Bucket=BUCKET, Prefix=base, Delimiter="/"
+    )
     return sorted(
-        entry.path.rsplit("/", 1)[-1]
-        for entry in s3.get_file_info(selector)
-        if entry.type == fs.FileType.Directory
+        common["Prefix"][len(base) : -1]
+        for page in pages
+        for common in page.get("CommonPrefixes", [])
     )
 
 
-def _resolve_streams(s3: fs.S3FileSystem) -> tuple[str, ...]:
+def _list_keys(client: S3Client, prefix: str) -> list[str]:
+    """Every key under `prefix`, in key order."""
+    pages = client.get_paginator("list_objects_v2").paginate(Bucket=BUCKET, Prefix=prefix)
+    return [obj["Key"] for page in pages for obj in page.get("Contents", [])]
+
+
+def _exists(client: S3Client, key: str) -> bool:
+    try:
+        client.head_object(Bucket=BUCKET, Key=key)
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] == "404":
+            return False
+        raise
+    return True
+
+
+def _resolve_streams(client: S3Client) -> tuple[str, ...]:
     """Streams are the top-level prefixes in the bucket, or an explicit override.
 
     Discovering them means a stream added by a new sidecar is compacted without a
@@ -67,117 +87,106 @@ def _resolve_streams(s3: fs.S3FileSystem) -> tuple[str, ...]:
     raw = os.environ.get("COMPACT_STREAMS", "").strip()
     if raw:
         return tuple(s.strip() for s in raw.split(",") if s.strip())
-    return tuple(_subdirs(s3, BUCKET))
+    return tuple(_subdirs(client, ""))
 
 
-def _stream_days(s3: fs.S3FileSystem, stream: str) -> list[str]:
+def _stream_days(client: S3Client, stream: str) -> list[str]:
     """Return every YYYY/MM/DD prefix present for a stream, newest first."""
-    base = f"{BUCKET}/{stream}"
     days: list[str] = []
-    for year in _subdirs(s3, base):
-        for month in _subdirs(s3, f"{base}/{year}"):
-            days.extend(f"{year}/{month}/{day}" for day in _subdirs(s3, f"{base}/{year}/{month}"))
+    for year in _subdirs(client, stream):
+        for month in _subdirs(client, f"{stream}/{year}"):
+            days.extend(
+                f"{year}/{month}/{day}" for day in _subdirs(client, f"{stream}/{year}/{month}")
+            )
     return sorted(days, reverse=True)
 
 
-@_retry
-def _is_compacted(s3: fs.S3FileSystem, stream: str, day: str) -> bool:
-    info = s3.get_file_info(f"{BUCKET}/{stream}/{day}/daily.parquet")
-    return bool(info.type == fs.FileType.File)
+def _is_compacted(client: S3Client, stream: str, day: str) -> bool:
+    return _exists(client, f"{stream}/{day}/daily.parquet")
 
 
-def _pending_days(s3: fs.S3FileSystem, stream: str, today: str, limit: int) -> list[str]:
+def _pending_days(client: S3Client, stream: str, today: str, limit: int) -> list[str]:
     """Up to `limit` days for this stream that still have no daily.parquet, newest first.
 
     Today is skipped because its hours are still being written. Walking newest-first
     stops after `limit` hits, so an already-compacted stream costs a handful of probes.
     """
     pending: list[str] = []
-    for day in _stream_days(s3, stream):
+    for day in _stream_days(client, stream):
         if day >= today:
             continue
-        if not _is_compacted(s3, stream, day):
+        if not _is_compacted(client, stream, day):
             pending.append(day)
             if len(pending) >= limit:
                 break
     return pending
 
 
-@_retry
-def _list_hour_parquets(s3: fs.S3FileSystem, day_prefix: str) -> list[str]:
-    """List *.parquet under <day_prefix>/HH/, hour-by-hour to keep each call small.
-
-    A single recursive list over a day with a burst hour (thousands of files) can
-    exceed the S3 client's slow-transfer threshold; iterating per hour keeps each
-    response well under that bound.
-    """
-    sources: list[str] = []
-    for hh in range(24):
-        prefix = f"{day_prefix}/{hh:02d}"
-        selector = fs.FileSelector(prefix, recursive=False, allow_not_found=True)
-        sources.extend(f.path for f in s3.get_file_info(selector) if f.path.endswith(".parquet"))
-    return sources
+def _hour_parquets(client: S3Client, day_prefix: str) -> list[str]:
+    """The *.parquet keys under <day_prefix>/HH/."""
+    base = f"{day_prefix}/"
+    return [key for key in _list_keys(client, base) if _HOUR_FILE.fullmatch(key[len(base) :])]
 
 
-@_retry
-def _read_table(s3: fs.S3FileSystem, sources: list[str]) -> pa.Table:
-    return pq.read_table(sources, filesystem=s3)
+def _download(client: S3Client, key: str) -> pa.Table:
+    """Read one Parquet object; the transfer retries a body cut off mid-read."""
+    buffer = io.BytesIO()
+    client.download_fileobj(BUCKET, key, buffer)
+    buffer.seek(0)
+    return pq.read_table(buffer)
 
 
-@_retry
-def _write_daily(s3: fs.S3FileSystem, table: pa.Table, daily: str) -> None:
-    pq.write_table(table, daily, filesystem=s3, compression="zstd")
+def _read_table(client: S3Client, keys: list[str]) -> pa.Table:
+    """Read and concatenate the files, which must share one schema."""
+    return pa.concat_tables([_download(client, key) for key in keys])
 
 
-@_retry
-def _delete_one(s3: fs.S3FileSystem, key: str) -> None:
-    s3.delete_file(key)
+def _write_daily(client: S3Client, table: pa.Table, key: str) -> None:
+    with tempfile.NamedTemporaryFile(suffix=".parquet") as tmp:
+        pq.write_table(table, tmp.name, compression="zstd")
+        client.upload_file(tmp.name, BUCKET, key)
 
 
-def _delete_merged(s3: fs.S3FileSystem, sources: list[str]) -> None:
-    """Delete exactly the hour files that went into the daily file.
-
-    Deleting the hour directories instead removes whatever was written after the
-    listing, and pyarrow re-asserts the day prefix as an empty object once its last
-    child is gone, which left one empty marker per compacted day (lares#2522). S3
-    has no directories, so a prefix disappears with its last key.
-    """
-    for key in sources:
-        try:
-            _delete_one(s3, key)
-        except FileNotFoundError:
-            # A retried batch re-deletes keys the previous attempt already removed.
-            continue
+def _delete_keys(client: S3Client, keys: list[str]) -> None:
+    """Delete exactly these keys and nothing else; a key already gone counts as deleted."""
+    for start in range(0, len(keys), DELETE_BATCH):
+        batch = keys[start : start + DELETE_BATCH]
+        response = client.delete_objects(
+            Bucket=BUCKET,
+            Delete={"Objects": [{"Key": key} for key in batch], "Quiet": True},
+        )
+        errors = response.get("Errors", [])
+        if errors:
+            raise RuntimeError(f"{len(errors)} of {len(batch)} keys not deleted: {errors[0]}")
 
 
-def _compact(s3: fs.S3FileSystem, stream: str, day: str) -> str:
+def _compact(client: S3Client, stream: str, day: str) -> str:
     """Merge stream's hour-files for `day` into one daily.parquet. Return status string."""
-    day_prefix = f"{BUCKET}/{stream}/{day}"
-    daily = f"{day_prefix}/daily.parquet"
+    day_prefix = f"{stream}/{day}"
 
-    if s3.get_file_info(daily).type == fs.FileType.File:
+    if _is_compacted(client, stream, day):
         return "already-compacted"
 
-    sources = _list_hour_parquets(s3, day_prefix)
+    sources = _hour_parquets(client, day_prefix)
     if not sources:
         return "no-source-files"
 
-    table = _read_table(s3, sources)
-    _write_daily(s3, table, daily)
+    table = _read_table(client, sources)
+    _write_daily(client, table, f"{day_prefix}/daily.parquet")
 
-    if s3.get_file_info(daily).type != fs.FileType.File:
+    if not _is_compacted(client, stream, day):
         raise RuntimeError("daily.parquet missing after write")
 
-    _delete_merged(s3, sources)
+    _delete_keys(client, sources)
 
     return "compacted"
 
 
-def _targets(s3: fs.S3FileSystem, stream: str, day: str, today: str, backfill: int) -> list[str]:
+def _targets(client: S3Client, stream: str, day: str, today: str, backfill: int) -> list[str]:
     """The days to compact for this stream: the single day, or a bounded backfill."""
     if backfill <= 0:
         return [day]
-    return _pending_days(s3, stream, today, backfill)
+    return _pending_days(client, stream, today, backfill)
 
 
 def main() -> None:
@@ -196,8 +205,8 @@ def main() -> None:
     # An explicit day names exactly one target, so backfill only applies without it.
     backfill = 0 if explicit_day else int(os.environ.get("COMPACT_BACKFILL_DAYS", "0"))
 
-    s3 = _build_s3()
-    streams = _resolve_streams(s3)
+    client = _build_client()
+    streams = _resolve_streams(client)
     log.info("compaction.start", day=day, backfill_days=backfill, streams=list(streams))
 
     failed: list[str] = []
@@ -205,15 +214,15 @@ def main() -> None:
 
     for stream in streams:
         try:
-            targets = _targets(s3, stream, day, today, backfill)
-        except Exception as exc:  # pyarrow raises a wide net of OSError-likes
+            targets = _targets(client, stream, day, today, backfill)
+        except Exception as exc:  # botocore raises ClientError and a family of connection errors
             log.error("compaction.stream", stream=stream, status="list-failed", error=str(exc))
             failed.append(stream)
             continue
 
         for target in targets:
             try:
-                status = _compact(s3, stream, target)
+                status = _compact(client, stream, target)
                 if status == "compacted":
                     compacted += 1
                 log.info("compaction.stream", stream=stream, day=target, status=status)

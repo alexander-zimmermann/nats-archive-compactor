@@ -16,9 +16,9 @@ classifiers = [
     "Topic :: System :: Archiving",
 ]
 dependencies = [
+    "boto3>=1.43.118",
     "pyarrow>=26.0.0",
     "structlog>=26.1.0",
-    "tenacity>=9.2.1",
 ]
 
 [project.optional-dependencies]
@@ -27,6 +27,8 @@ dev = [
     "ruff>=0.17.2",
     "mypy>=2.4.0",
     "pre-commit>=4.7.0",
+    "testcontainers>=4.15.0",
+    "boto3-stubs[s3]>=1.43.118",
 ]
 
 [project.scripts]
@@ -51,15 +53,9 @@ python_version = "3.13"
 strict = true
 
 [[tool.mypy.overrides]]
-# pyarrow ships partial stubs — `pyarrow.fs.S3FileSystem`, `FileSelector`,
-# `FileType`, and the read_table/write_table functions are missing or
-# untyped in the upstream stubs.
+# pyarrow ships no type information (no stubs, no py.typed marker).
 module = ["pyarrow", "pyarrow.*"]
 ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = ["nats_archive_compactor.__main__"]
-disable_error_code = ["name-defined", "attr-defined", "no-untyped-call"]
 
 # Pylance/Pyright counterparts — quiet the same pyarrow stub gaps.
 [tool.pyright]
