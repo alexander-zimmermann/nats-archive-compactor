@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from nats_archive_compactor.__main__ import BUCKET, _list_keys
+from nats_archive_compactor.__main__ import BUCKET, _list_objects
 
 if TYPE_CHECKING:
     from mypy_boto3_s3 import S3Client
@@ -43,7 +43,7 @@ class Store:
 
     def keys(self) -> list[str]:
         """Every key in the bucket, markers included."""
-        return sorted(_list_keys(self.client, ""))
+        return sorted(_list_objects(self.client, ""))
 
     def table(self, key: str) -> pa.Table:
         body = self.client.get_object(Bucket=BUCKET, Key=key)["Body"].read()

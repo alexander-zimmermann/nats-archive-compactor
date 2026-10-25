@@ -1,6 +1,6 @@
 # nats-archive-compactor
 
-Daily compactor for the `nats-archive` bucket on RustFS. Merges a day's hourly Parquet files per stream into one `daily.parquet`, then deletes the merged hour files. Designed to be run as a Kubernetes CronJob.
+Daily compactor for the `nats-archive` bucket on RustFS. Merges a day's hourly Parquet files per stream into one `daily.parquet`, then deletes the merged hour files; once a month is over by a month, rolls its daily files up into one `monthly.parquet`. Designed to be run as a Kubernetes CronJob.
 
 ## What it does
 
@@ -14,6 +14,19 @@ For a given UTC date (yesterday by default) and each stream, the compactor:
 
 With `COMPACT_BACKFILL_DAYS` set, each run also catches up days that never got a daily file, newest first and bounded by that number, skipping the current day because its hours are still being written.
 
+With `COMPACT_ROLLUP_MONTHS` set, each run then rolls up, per stream and oldest first, up to that many months whose following month is over. A month that cannot be rolled up fails the run and the next one is tried, so it blocks no other:
+
+```
+<stream>/2026/08/monthly.parquet          rolled up (September is over)
+<stream>/2026/09/15/daily.parquet         still daily
+<stream>/2026/10/24/09/<uuid>.parquet     still hourly, compacted tonight
+```
+
+1. Only daily files and empty marker objects may be in the month; anything else (an hour file never merged) leaves the month alone and fails the run.
+2. The daily files, which must share one schema, are streamed day by day into `monthly.parquet`; its footer records each day's row count under `daily_rows`.
+3. Nothing is deleted unless the monthly file's row count equals the recorded total and every daily file left has exactly its recorded rows. A freshly written monthly file that fails this check is removed again, so the month stays daily.
+4. Then the daily files and the markers beside them are deleted. A run cut off while deleting finishes on the next run, which checks the remaining days against the recorded rows.
+
 All S3 access goes through boto3 on plain keys. pyarrow's S3 filesystem emulates directories and writes an empty marker object for the parent after every delete, so it is only used for the Parquet encoding. boto3 retries transient errors itself (standard mode, 3 attempts in total, and a download cut off mid-body) so a slow response from the storage backend does not abort the stream. Failures on individual streams are logged and the process exits non-zero only if any stream failed, so Kubernetes' `backoffLimit` semantics still work as expected.
 
 ## Configuration
@@ -23,9 +36,10 @@ All S3 access goes through boto3 on plain keys. pyarrow's S3 filesystem emulates
 | `RUSTFS_URL`          | Required. e.g. `http://rustfs-svc.rustfs.svc.cluster.local:9000`                                |
 | `ACCESS_KEY`          | Required. RustFS S3 access key                                                                  |
 | `SECRET_KEY`          | Required. RustFS S3 secret key                                                                  |
-| `COMPACT_DAY`         | Optional. `YYYY/MM/DD` override; defaults to yesterday in UTC. Names one day, so it disables backfill |
+| `COMPACT_DAY`         | Optional. `YYYY/MM/DD` override; defaults to yesterday in UTC. Names one day, so it disables backfill and rollup |
 | `COMPACT_STREAMS`     | Optional. Comma-separated subset of streams (e.g. `knx,ems_esp`); defaults to every prefix in the bucket |
 | `COMPACT_BACKFILL_DAYS` | Optional. Per stream, how many days without a daily file to catch up per run (default `0`, i.e. one day only) |
+| `COMPACT_ROLLUP_MONTHS` | Optional. Per stream, how many finished months to roll up into a monthly file per run (default `0`, off) |
 | `S3_REQUEST_TIMEOUT`  | Optional. Read timeout per S3 call in seconds (default `60`)                                    |
 | `S3_CONNECT_TIMEOUT`  | Optional. Connect timeout in seconds (default `10`)                                             |
 
