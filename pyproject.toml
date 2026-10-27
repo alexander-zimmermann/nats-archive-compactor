@@ -16,7 +16,7 @@ classifiers = [
     "Topic :: System :: Archiving",
 ]
 dependencies = [
-    "boto3>=1.43.119",
+    "boto3>=1.43.120",
     "pyarrow>=26.0.0",
     "structlog>=26.1.0",
 ]
