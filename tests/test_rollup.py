@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import datetime as dt
+from collections.abc import Iterator
 
 import pyarrow as pa
 import pytest
 
 import nats_archive_compactor.__main__ as compactor
-from nats_archive_compactor.__main__ import _last_month, _pending_months, _rollup
+from nats_archive_compactor.__main__ import _footer, _last_month, _pending_months, _rollup
 
 from .support import Store
 
@@ -75,12 +76,14 @@ def test_a_rollup_that_loses_rows_deletes_nothing(
 ) -> None:
     """A monthly file short of rows is dropped again, and every daily file stays."""
     seeded = _daily_month(store)
-    download = compactor._download
+    batches = compactor._batches
 
-    def download_dropping_a_row(client: object, key: str) -> pa.Table:
-        return download(store.client, key).slice(1)
+    def batches_dropping_a_row(client: object, key: str) -> Iterator[pa.RecordBatch]:
+        rest = batches(store.client, key)
+        yield next(rest).slice(1)
+        yield from rest
 
-    monkeypatch.setattr(compactor, "_download", download_dropping_a_row)
+    monkeypatch.setattr(compactor, "_batches", batches_dropping_a_row)
 
     with pytest.raises(RuntimeError, match="rows"):
         _rollup(store.client, "knx", "2026/08")
@@ -157,6 +160,38 @@ def test_a_month_left_with_only_markers_is_swept(store: Store) -> None:
     assert _rollup(store.client, "knx", "2026/08") == "already-rolled-up"
 
     assert store.keys() == ["knx/2026/08/monthly.parquet"]
+
+
+def _archive_table(rows: int, *, nullable: bool) -> pa.Table:
+    """The archive's three string columns, nullable as DuckDB wrote them or not null as pyarrow."""
+    schema = pa.schema(
+        [pa.field(name, pa.string(), nullable=nullable) for name in ("payload", "subject", "time")]
+    )
+    return pa.table({name: [f"{name}.{i}" for i in range(rows)] for name in schema.names}, schema)
+
+
+def test_a_day_with_nullable_columns_rolls_up_with_the_rest(store: Store) -> None:
+    """1 May 2026 was written by DuckDB with nullable columns, the rest of May not null."""
+    store.put_table("knx/2026/05/01/daily.parquet", _archive_table(3, nullable=True))
+    store.put_table("knx/2026/05/02/daily.parquet", _archive_table(4, nullable=False))
+
+    assert _rollup(store.client, "knx", "2026/05") == "rolled-up"
+
+    assert store.keys() == ["knx/2026/05/monthly.parquet"]
+    assert store.table("knx/2026/05/monthly.parquet").num_rows == 7
+
+
+def test_a_day_larger_than_a_batch_is_read_in_pieces(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No day is held whole: every batch becomes a row group of its own."""
+    monkeypatch.setattr(compactor, "ROLLUP_BATCH_ROWS", 2)
+    _daily_month(store)
+
+    assert _rollup(store.client, "knx", "2026/08") == "rolled-up"
+
+    monthly = _footer(store.client, "knx/2026/08/monthly.parquet")
+    assert (monthly.num_rows, monthly.num_row_groups) == (7, 4)
 
 
 def test_a_month_with_two_schemas_deletes_nothing(store: Store) -> None:
