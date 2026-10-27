@@ -1,6 +1,6 @@
 [project]
 name = "nats-archive-compactor"
-version = "0.10.0"
+version = "0.11.0"
 description = "Compactor for the nats-archive bucket on RustFS: merges hourly Parquet files into daily files and finished months into monthly files"
 readme = "README.md"
 license = "GPL-2.0-or-later"
