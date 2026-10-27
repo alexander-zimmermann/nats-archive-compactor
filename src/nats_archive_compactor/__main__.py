@@ -8,7 +8,7 @@ import re
 import sys
 import tempfile
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
@@ -29,6 +29,7 @@ DEFAULT_CONNECT_TIMEOUT = 10.0
 RETRY_ATTEMPTS = 3
 DELETE_BATCH = 1000  # the most keys one DeleteObjects call takes
 DAILY_ROWS = b"daily_rows"  # monthly.parquet metadata: rows taken from each day
+ROLLUP_BATCH_ROWS = 16_384  # rows read and written at a time, so a day of any size fits in memory
 
 _HOUR_FILE = re.compile(r"\d{2}/[^/]+\.parquet")
 _DAILY_FILE = re.compile(r"(\d{2})/daily\.parquet")
@@ -144,12 +145,22 @@ def _hour_parquets(client: S3Client, day_prefix: str) -> list[str]:
     return [key for key in _list_objects(client, base) if _HOUR_FILE.fullmatch(key[len(base) :])]
 
 
-def _download(client: S3Client, key: str) -> pa.Table:
-    """Read one Parquet object; the transfer retries a body cut off mid-read."""
+def _fetch(client: S3Client, key: str) -> io.BytesIO:
+    """One object's body; the transfer retries a body cut off mid-read."""
     buffer = io.BytesIO()
     client.download_fileobj(BUCKET, key, buffer)
     buffer.seek(0)
-    return pq.read_table(buffer)
+    return buffer
+
+
+def _download(client: S3Client, key: str) -> pa.Table:
+    """Read one Parquet object whole."""
+    return pq.read_table(_fetch(client, key))
+
+
+def _batches(client: S3Client, key: str) -> Iterator[pa.RecordBatch]:
+    """Read one Parquet object in batches of ROLLUP_BATCH_ROWS rows."""
+    yield from pq.ParquetFile(_fetch(client, key)).iter_batches(batch_size=ROLLUP_BATCH_ROWS)
 
 
 def _read_table(client: S3Client, keys: list[str]) -> pa.Table:
@@ -206,6 +217,17 @@ def _footer(client: S3Client, key: str) -> pq.FileMetaData:
     return pq.read_metadata(pa.BufferReader(footer["Body"].read()))
 
 
+def _conform(batch: pa.RecordBatch, schema: pa.Schema) -> pa.RecordBatch:
+    """The batch in `schema`, whose column names and types it must share.
+
+    Only nullability may differ: DuckDB wrote the first daily files (1 May 2026) with
+    nullable columns, pyarrow writes them not null. A null the schema forbids fails the cast.
+    """
+    if [(f.name, f.type) for f in batch.schema] != [(f.name, f.type) for f in schema]:
+        raise ValueError(f"schema {batch.schema} does not match {schema}")
+    return batch.cast(schema)
+
+
 def _write_monthly(client: S3Client, key: str, dailies: dict[str, str]) -> None:
     """Stream the daily files, which must share one schema, into one Parquet object."""
     days = sorted(dailies.items())
@@ -214,9 +236,10 @@ def _write_monthly(client: S3Client, key: str, dailies: dict[str, str]) -> None:
     with tempfile.NamedTemporaryFile(suffix=".parquet") as tmp:
         with pq.ParquetWriter(tmp.name, schema, compression="zstd") as writer:
             for day, daily in days:
-                table = _download(client, daily)
-                writer.write_table(table)
-                rows[day] = table.num_rows
+                rows[day] = 0
+                for batch in _batches(client, daily):
+                    writer.write_batch(_conform(batch, schema))
+                    rows[day] += batch.num_rows
             writer.add_key_value_metadata({DAILY_ROWS: json.dumps(rows)})
         client.upload_file(tmp.name, BUCKET, key)
 
