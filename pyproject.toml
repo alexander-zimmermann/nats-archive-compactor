@@ -4,7 +4,7 @@ version = "0.10.0"
 description = "Compactor for the nats-archive bucket on RustFS: merges hourly Parquet files into daily files and finished months into monthly files"
 readme = "README.md"
 license = "GPL-2.0-or-later"
-requires-python = ">=3.15.1"
+requires-python = ">=3.15.2"
 authors = [
     { name = "Alexander Zimmermann" },
 ]
@@ -16,7 +16,7 @@ classifiers = [
     "Topic :: System :: Archiving",
 ]
 dependencies = [
-    "boto3>=1.43.118",
+    "boto3>=1.43.119",
     "pyarrow>=26.0.0",
     "structlog>=26.1.0",
 ]
@@ -24,11 +24,11 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=9.1.1",
-    "ruff>=0.17.2",
+    "ruff>=0.17.3",
     "mypy>=2.4.0",
     "pre-commit>=4.7.0",
     "testcontainers>=4.15.0",
-    "boto3-stubs[s3]>=1.43.118",
+    "boto3-stubs[s3]>=1.43.119",
 ]
 
 [project.scripts]
