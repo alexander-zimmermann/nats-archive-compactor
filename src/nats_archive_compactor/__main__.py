@@ -35,7 +35,7 @@ ROLLUP_BATCH_ROWS = 16_384  # rows read and written at a time, so a day of any s
 MONTHLY_BACKUP = "monthly.parquet.orig"  # a deduplicated month's file as it was before
 MONTHLY_REWRITE = "monthly.parquet.new"  # a deduplicated month's file until it is verified
 ARCHIVE_COLUMNS = ("payload", "subject", "time")  # the column order the archive writes today
-ROW_FIELDS = ("time", "subject", "payload")  # what makes rows identical, payload last
+ROW_FIELDS = ("time", "subject", "payload")  # what makes rows identical
 REDELIVERY_DAYS = ("2026/05/01", "2026/05/27")  # NATS redelivered every message every 30 s
 FILE_BUFFER_BYTES = 1 << 20  # read buffer for a local Parquet file
 
@@ -344,12 +344,17 @@ def _day_batches(path: str, days: dict[str, int]) -> Iterator[tuple[str, pa.Reco
 
 
 def _batch_digests(batch: pa.RecordBatch) -> list[bytes]:
-    """Each row's identity; only payload, the last field, may hold a NUL byte."""
+    """Each row's identity, hashed from the repr of its values, so any column type compares."""
     columns = (batch.column(name).to_pylist() for name in ROW_FIELDS)
     return [
-        hashlib.blake2b("\0".join(row).encode(), digest_size=16).digest()
+        hashlib.blake2b(repr(row).encode(), digest_size=16).digest()
         for row in zip(*columns, strict=True)
     ]
+
+
+def _day_after(day: str, before: str | None) -> bool:
+    """Whether `day` directly follows `before` within the month."""
+    return before is not None and int(day) == int(before) + 1
 
 
 def _redelivered(month: str, day: str) -> bool:
@@ -370,7 +375,8 @@ def _first_rows(
     current_day = None
     for day, batch in batches:
         if day != current_day:
-            previous, current, current_day = current, set(), day
+            previous = current if _day_after(day, current_day) else set()
+            current, current_day = set(), day
         if not _redelivered(month, day):
             yield day, batch
             continue
@@ -434,7 +440,8 @@ def _verify_deduped(
     number = 0
     for day, batch in _day_batches(source, days):
         if day != current_day:
-            previous, current, current_day = current, set(), day
+            previous = current if _day_after(day, current_day) else set()
+            current, current_day = set(), day
         for digest in _batch_digests(batch):
             number += 1
             if ahead == (day, digest):

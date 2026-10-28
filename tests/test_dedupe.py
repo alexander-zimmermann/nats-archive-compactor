@@ -98,6 +98,26 @@ def test_a_repeat_written_the_next_day_goes_too(store: Store) -> None:
     assert _rows(store.table("knx/2026/05/monthly.parquet")) == [A, B, C]
 
 
+def test_a_repeat_two_days_later_stays(store: Store) -> None:
+    """Only the same or the previous calendar day count, even with a day without rows between."""
+    _rolled_up_month(store, "knx", {"02": [A], "04": [A]})
+
+    _dedupe(store.client, "knx", "2026/05")
+
+    assert _rows(store.table("knx/2026/05/monthly.parquet")) == [A, A]
+
+
+def test_rows_are_compared_by_value_whatever_their_column_types(store: Store) -> None:
+    """A time column stored as timestamps is rewritten like one stored as strings."""
+    store.put_parquet("knx/2026/05/02/daily.parquet", rows=2)
+    store.put_parquet("knx/2026/05/03/daily.parquet", rows=3)
+    _rollup(store.client, "knx", "2026/05")
+
+    assert _dedupe(store.client, "knx", "2026/05") == "deduped"
+
+    assert store.table("knx/2026/05/monthly.parquet").num_rows == 5
+
+
 def test_repeats_after_the_redelivery_days_stay(store: Store) -> None:
     """Only 1 to 27 May 2026 had copies, so no other day loses a row."""
     _rolled_up_month(store, "knx", {"27": [A, A], "28": [C, C]})
