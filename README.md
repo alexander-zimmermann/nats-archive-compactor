@@ -27,6 +27,12 @@ With `COMPACT_ROLLUP_MONTHS` set, each run then rolls up, per stream and oldest 
 3. Nothing is deleted unless the monthly file's row count equals the recorded total and every daily file left has exactly its recorded rows. A freshly written monthly file that fails this check is removed again, so the month stays daily.
 4. Then the daily files and the markers beside them are deleted. A run cut off while deleting finishes on the next run, which checks the remaining days against the recorded rows.
 
+With `COMPACT_DEDUPE_MONTH` set, the run does nothing else: for each stream named in `COMPACT_STREAMS` it rewrites that month's `monthly.parquet` with its columns in the order the archive writes today, and from 1 to 27 May 2026 without exact repeats. On those days NATS redelivered every message every 30 s until its batch was written; where `time` comes from the payload (knx, solaredge), each copy is a row identical in `time`, `subject` and `payload`. Streams stamped with the delivery time are left out of May, because their copies differ in `time`. Every other day keeps all its rows.
+
+1. The monthly file is copied to `monthly.parquet.orig` beside it, unless that key exists; a later run reads from it, so a run cut off is simply repeated. The backup stays until the rewritten month is accepted.
+2. The backup is downloaded and streamed into `monthly.parquet.new`, keeping the first of each set of identical rows in file order. Copies land within a day of their original, so only the current and the previous day's rows are remembered. `daily_rows` records the rows kept per day.
+3. The new file is downloaded again and walked beside the backup: every row left out needs an identical row kept on the same or the previous day of a redelivery day, every other day must keep all its rows, and the file holds nothing else. Only then is it copied over `monthly.parquet`; otherwise it is deleted and the month stays as it was.
+
 All S3 access goes through boto3 on plain keys. pyarrow's S3 filesystem emulates directories and writes an empty marker object for the parent after every delete, so it is only used for the Parquet encoding. boto3 retries transient errors itself (standard mode, 3 attempts in total, and a download cut off mid-body) so a slow response from the storage backend does not abort the stream. Failures on individual streams are logged and the process exits non-zero only if any stream failed, so Kubernetes' `backoffLimit` semantics still work as expected.
 
 ## Configuration
@@ -40,6 +46,7 @@ All S3 access goes through boto3 on plain keys. pyarrow's S3 filesystem emulates
 | `COMPACT_STREAMS`     | Optional. Comma-separated subset of streams (e.g. `knx,ems_esp`); defaults to every prefix in the bucket |
 | `COMPACT_BACKFILL_DAYS` | Optional. Per stream, how many days without a daily file to catch up per run (default `0`, i.e. one day only) |
 | `COMPACT_ROLLUP_MONTHS` | Optional. Per stream, how many finished months to roll up into a monthly file per run (default `0`, off) |
+| `COMPACT_DEDUPE_MONTH` | Optional. `YYYY/MM` whose monthly file loses its exact repeats; needs `COMPACT_STREAMS` and disables everything else |
 | `S3_REQUEST_TIMEOUT`  | Optional. Read timeout per S3 call in seconds (default `60`)                                    |
 | `S3_CONNECT_TIMEOUT`  | Optional. Connect timeout in seconds (default `10`)                                             |
 
