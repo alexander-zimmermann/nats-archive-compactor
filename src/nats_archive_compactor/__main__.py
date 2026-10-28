@@ -220,18 +220,24 @@ def _footer(client: S3Client, key: str) -> pq.FileMetaData:
 def _conform(batch: pa.RecordBatch, schema: pa.Schema) -> pa.RecordBatch:
     """The batch in `schema`, whose column names and types it must share.
 
-    Only nullability may differ: DuckDB wrote the first daily files (1 May 2026) with
-    nullable columns, pyarrow writes them not null. A null the schema forbids fails the cast.
+    Only order and nullability may differ: DuckDB wrote the first daily files (1 May 2026)
+    with nullable columns, pyarrow writes them not null, and warp_charge_tracker's 1 May was
+    made by hand with its columns in another order. A null the schema forbids fails the cast.
     """
+    if sorted(batch.schema.names) == sorted(schema.names):
+        batch = batch.select(schema.names)
     if [(f.name, f.type) for f in batch.schema] != [(f.name, f.type) for f in schema]:
         raise ValueError(f"schema {batch.schema} does not match {schema}")
     return batch.cast(schema)
 
 
 def _write_monthly(client: S3Client, key: str, dailies: dict[str, str]) -> None:
-    """Stream the daily files, which must share one schema, into one Parquet object."""
+    """Stream the daily files, which must share one schema, into one Parquet object.
+
+    The newest day sets the schema, so the file gets the column order the archive writes today.
+    """
     days = sorted(dailies.items())
-    schema = _footer(client, days[0][1]).schema.to_arrow_schema()
+    schema = _footer(client, days[-1][1]).schema.to_arrow_schema()
     rows: dict[str, int] = {}
     with tempfile.NamedTemporaryFile(suffix=".parquet") as tmp:
         with pq.ParquetWriter(tmp.name, schema, compression="zstd") as writer:

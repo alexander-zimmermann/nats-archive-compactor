@@ -181,6 +181,25 @@ def test_a_day_with_nullable_columns_rolls_up_with_the_rest(store: Store) -> Non
     assert store.table("knx/2026/05/monthly.parquet").num_rows == 7
 
 
+def test_a_day_with_its_columns_in_another_order_rolls_up_in_the_newest_order(
+    store: Store,
+) -> None:
+    """warp_charge_tracker's 1 May 2026 was made by hand with its columns in another order."""
+    first = _archive_table(3, nullable=True).select(["time", "subject", "payload"])
+    store.put_table("warp_charge_tracker/2026/05/01/daily.parquet", first)
+    store.put_table(
+        "warp_charge_tracker/2026/05/02/daily.parquet", _archive_table(4, nullable=False)
+    )
+
+    assert _rollup(store.client, "warp_charge_tracker", "2026/05") == "rolled-up"
+
+    monthly = store.table("warp_charge_tracker/2026/05/monthly.parquet")
+    assert monthly.schema.names == ["payload", "subject", "time"]
+    assert sorted(monthly.column("time").to_pylist()) == sorted(
+        [f"time.{i}" for i in range(3)] + [f"time.{i}" for i in range(4)]
+    )
+
+
 def test_a_day_larger_than_a_batch_is_read_in_pieces(
     store: Store, monkeypatch: pytest.MonkeyPatch
 ) -> None:
