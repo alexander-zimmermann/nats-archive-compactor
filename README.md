@@ -23,7 +23,7 @@ With `COMPACT_ROLLUP_MONTHS` set, each run then rolls up, per stream and oldest 
 ```
 
 1. Only daily files and empty marker objects may be in the month; anything else (an hour file never merged) leaves the month alone and fails the run.
-2. The daily files, which must share one schema, are streamed in batches of 16,384 rows into `monthly.parquet`, so a day of any size fits in memory; its footer records each day's row count under `daily_rows`. Only nullability may differ between days: DuckDB wrote the first daily files (1 May 2026) with nullable columns, and a null where the month's schema forbids one fails the month.
+2. The daily files, which must share one schema, are streamed in batches of 16,384 rows into `monthly.parquet`, so a day of any size fits in memory; its footer records each day's row count under `daily_rows`. The newest day sets the month's schema, so a month gets the column order the archive writes today; the April 2026 monthly files predate this and have `time, subject, payload`. Only column order and nullability may differ between days: DuckDB wrote the first daily files (1 May 2026) with nullable columns, `warp_charge_tracker`'s 1 May was made by hand with its columns in another order, and a null where the month's schema forbids one fails the month.
 3. Nothing is deleted unless the monthly file's row count equals the recorded total and every daily file left has exactly its recorded rows. A freshly written monthly file that fails this check is removed again, so the month stays daily.
 4. Then the daily files and the markers beside them are deleted. A run cut off while deleting finishes on the next run, which checks the remaining days against the recorded rows.
 
