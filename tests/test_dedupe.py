@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 from collections.abc import Iterator
 
 import pyarrow as pa
@@ -187,10 +188,116 @@ def test_the_switch_without_named_streams_touches_nothing(
 
 
 def test_rows_differing_only_in_time_stay(store: Store) -> None:
-    """Only identical rows are repeats; a redelivery stamped with its own time is not."""
+    """Only identical rows are exact repeats; a row stamped a moment later is not."""
     later = ("2026-05-02T10:00:30.1Z", *A[1:])
-    _rolled_up_month(store, "ems_esp", {"02": [A, later]})
+    _rolled_up_month(store, "dyson", {"02": [A, later]})
 
-    _dedupe(store.client, "ems_esp", "2026/05")
+    _dedupe(store.client, "dyson", "2026/05")
 
-    assert _rows(store.table("ems_esp/2026/05/monthly.parquet")) == [A, later]
+    assert _rows(store.table("dyson/2026/05/monthly.parquet")) == [A, later]
+
+
+def _day_lines(output: str) -> list[tuple[object, ...]]:
+    """The (day, subject, rows, kept) of each day line the run logged as JSON."""
+    events = [json.loads(line) for line in output.splitlines() if line.startswith("{")]
+    return [
+        (e["day"], e["subject"], e["rows"], e["kept"])
+        for e in events
+        if e["event"] == "compaction.dedupe.day"
+    ]
+
+
+def _switch(monkeypatch: pytest.MonkeyPatch, stream: str, *, dry_run: bool) -> None:
+    monkeypatch.setenv("COMPACT_STREAMS", stream)
+    monkeypatch.setenv("COMPACT_DEDUPE_MONTH", "2026/05")
+    if dry_run:
+        monkeypatch.setenv("COMPACT_DEDUPE_DRY_RUN", "1")
+
+
+def test_a_dry_run_counts_repeats_and_writes_nothing(
+    store: Store, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _rolled_up_month(store, "knx", {"02": [A, B, A], "03": [C]})
+    seeded = store.keys()
+    _switch(monkeypatch, "knx", dry_run=True)
+
+    compactor.main()
+
+    assert store.keys() == seeded
+    assert _day_lines(capsys.readouterr().out) == [
+        ("2026-05-02", "knx.1/2/3", 3, 2),
+        ("2026-05-03", "knx.1/2/4", 1, 1),
+    ]
+
+
+HEARTBEAT = "ems-esp.heartbeat"
+MIXER = "ems-esp.mixer_data_hc1"
+
+
+def _ems_minute() -> list[Row]:
+    """One heartbeat minute of 10 May with six genuine mixer rows and four copies."""
+    beats = [
+        (f"2026-05-10T10:0{m}:00Z", HEARTBEAT, json.dumps({"uptime_sec": 1000 + 60 * m}))
+        for m in (0, 1)
+    ]
+    mixer = [(f"2026-05-10T10:00:{s:02d}Z", MIXER, '{"temp": 21.5}') for s in range(5, 60, 10)]
+    copies = [(f"2026-05-10T10:00:3{s}.5Z", MIXER, '{"temp": 21.5}') for s in range(4)]
+    return sorted(beats + mixer + copies)
+
+
+def test_a_dry_run_counts_the_copies_of_a_stream_stamped_at_delivery(
+    store: Store, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _rolled_up_month(store, "ems_esp", {"10": _ems_minute()})
+    seeded = store.keys()
+    _switch(monkeypatch, "ems_esp", dry_run=True)
+
+    compactor.main()
+
+    assert store.keys() == seeded
+    assert _day_lines(capsys.readouterr().out) == [
+        ("2026-05-10", HEARTBEAT, 2, 2),
+        ("2026-05-10", MIXER, 10, 6),
+    ]
+
+
+def test_a_stream_stamped_at_delivery_is_only_counted_yet(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rewriting its month needs a check of its own; until then only a dry run touches it."""
+    _rolled_up_month(store, "ems_esp", {"10": _ems_minute()})
+    seeded = store.keys()
+    _switch(monkeypatch, "ems_esp", dry_run=False)
+
+    with pytest.raises(SystemExit):
+        compactor.main()
+
+    assert store.keys() == seeded
+
+
+def test_a_dry_run_counts_the_original_once_a_rewrite_replaced_it(
+    store: Store, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """It reads what a rewrite would read, so a repeated run reports the same."""
+    _rolled_up_month(store, "knx", {"02": [A, B, A]})
+    _dedupe(store.client, "knx", "2026/05")
+    _switch(monkeypatch, "knx", dry_run=True)
+
+    compactor.main()
+
+    assert _day_lines(capsys.readouterr().out) == [("2026-05-02", "knx.1/2/3", 3, 2)]
+
+
+def test_a_dry_run_switch_other_than_0_or_1_touches_nothing(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A mistyped switch must not fall through to a real rewrite."""
+    _rolled_up_month(store, "knx", {"02": [A, A]})
+    seeded = store.keys()
+    _switch(monkeypatch, "knx", dry_run=False)
+    monkeypatch.setenv("COMPACT_DEDUPE_DRY_RUN", "true")
+
+    with pytest.raises(SystemExit):
+        compactor.main()
+
+    assert store.keys() == seeded
