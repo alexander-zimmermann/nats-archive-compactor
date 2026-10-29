@@ -225,3 +225,12 @@ def test_a_month_with_two_schemas_deletes_nothing(store: Store) -> None:
         _rollup(store.client, "ems_esp", "2026/08")
 
     assert store.keys() == seeded
+
+
+def test_only_two_digit_prefixes_are_days(store: Store) -> None:
+    """rustfs can leave a deleted object's key behind as an empty prefix; it is no day."""
+    store.put("knx/2026/04/monthly.parquet")
+    store.put("knx/2026/04/monthly.parquet.orig")
+    store.put("knx/2026/04/monthly.parquet.new/part.1")
+
+    assert _pending_months(store.client, "knx", before="2026/09") == []
