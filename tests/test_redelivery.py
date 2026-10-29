@@ -226,3 +226,14 @@ def test_a_falling_uptime_starts_the_count_afresh() -> None:
 
     kept = _kept(sorted(beats + rows), EMS, HEARTBEAT)
     assert _mixer_rows_between(kept, [0, 60, 70, 130]) == [6, 2, 6]
+
+
+def test_identical_rows_prove_a_single_redelivery() -> None:
+    """A row written twice may be one delivery, so it vouches for one copy 30 s later only."""
+    twin = (0.5, TEMPERATURE, "33")
+    rows = sorted(
+        _filler(0, 60) + [twin, twin, (30.5, TEMPERATURE, "33"), (30.6, TEMPERATURE, "33")]
+    )
+
+    kept = [row for row in _kept(rows, WARP) if row[1] == TEMPERATURE]
+    assert len(kept) == 2

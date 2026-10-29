@@ -343,15 +343,17 @@ def classify(d: Deliveries, rules: Rules) -> npt.NDArray[np.int8]:
     unique = _rows_of(d, rules.unique)
     periodic = _rows_of(d, rules.periodic)
     identical = _identical_to_earlier(d)
+    # A row written twice may be one delivery, so its twin vouches for no redelivery of its own.
+    deliveries = window & ~identical
     # Each periodic row repeating a delivery 30 s before, proven or not, only to order them.
     repeats_30_s = _after_30_s(
-        d, np.flatnonzero(window & periodic), np.full(len(d.time_us), np.iinfo(np.int64).max)
+        d, np.flatnonzero(deliveries & periodic), np.full(len(d.time_us), np.iinfo(np.int64).max)
     )
     surplus, counted = _beyond_device_count(
         d, rules, _earliest(d, per_day=True), repeats_30_s, ~identical
     )
     collecting = np.maximum(_block_open_until(d), _probe_open_until(d, unique))
-    proven = _after_30_s(d, np.flatnonzero(window & ~unique), collecting)
+    proven = _after_30_s(d, np.flatnonzero(deliveries & ~unique), collecting)
     reasons = np.select(
         [
             unique & ~_earliest(d, per_day=False),

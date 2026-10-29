@@ -301,3 +301,18 @@ def test_a_dry_run_switch_other_than_0_or_1_touches_nothing(
         compactor.main()
 
     assert store.keys() == seeded
+
+
+def test_a_dry_run_switch_without_a_month_touches_nothing(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without COMPACT_DEDUPE_MONTH the run would compact and roll up, which writes."""
+    yesterday = (dt.datetime.now(dt.UTC).date() - dt.timedelta(days=1)).strftime("%Y/%m/%d")
+    store.put_parquet(f"knx/{yesterday}/07/a.parquet", rows=1)
+    seeded = store.keys()
+    monkeypatch.setenv("COMPACT_DEDUPE_DRY_RUN", "1")
+
+    with pytest.raises(SystemExit):
+        compactor.main()
+
+    assert store.keys() == seeded

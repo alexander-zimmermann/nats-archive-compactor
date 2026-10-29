@@ -581,6 +581,10 @@ def main() -> None:
     if dry_run not in ("0", "1"):
         log.error("compaction.start", error="COMPACT_DEDUPE_DRY_RUN is 0 or 1")
         sys.exit(1)
+    # Compaction and rollup write, so a dry run without a month to count is no dry run.
+    if dry_run == "1" and not dedupe_month:
+        log.error("compaction.start", error="COMPACT_DEDUPE_DRY_RUN needs COMPACT_DEDUPE_MONTH")
+        sys.exit(1)
 
     client = _build_client()
     streams = _resolve_streams(client)
