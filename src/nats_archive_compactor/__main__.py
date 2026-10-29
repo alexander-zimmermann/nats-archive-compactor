@@ -104,13 +104,22 @@ def _resolve_streams(client: S3Client) -> tuple[str, ...]:
     return tuple(_subdirs(client, ""))
 
 
+def _dated(names: list[str], digits: int) -> list[str]:
+    """The names that are a date part of `digits` digits.
+
+    rustfs can keep a deleted object's key as an empty prefix, and that is no date.
+    """
+    return [name for name in names if len(name) == digits and name.isdigit()]
+
+
 def _stream_days(client: S3Client, stream: str) -> list[str]:
     """Return every YYYY/MM/DD prefix present for a stream, newest first."""
     days: list[str] = []
-    for year in _subdirs(client, stream):
-        for month in _subdirs(client, f"{stream}/{year}"):
+    for year in _dated(_subdirs(client, stream), 4):
+        for month in _dated(_subdirs(client, f"{stream}/{year}"), 2):
             days.extend(
-                f"{year}/{month}/{day}" for day in _subdirs(client, f"{stream}/{year}/{month}")
+                f"{year}/{month}/{day}"
+                for day in _dated(_subdirs(client, f"{stream}/{year}/{month}"), 2)
             )
     return sorted(days, reverse=True)
 
