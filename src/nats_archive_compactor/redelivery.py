@@ -81,34 +81,31 @@ class Deliveries:
         cls, batches: Iterable[pa.RecordBatch], rows: int, heartbeat: str | None = None
     ) -> Deliveries:
         """The archive's time, subject and payload columns of `rows` rows, batch by batch."""
-        d = cls(
-            time_us=np.empty(rows, np.int64),
-            subject=np.empty(rows, np.int16),
-            content=np.empty((rows, 2), np.uint64),
-            uptime=np.empty(rows, np.int32),
-            subjects=(),
-        )
+        time_us = np.empty(rows, np.int64)
+        subject = np.empty(rows, np.int16)
+        content = np.empty((rows, 2), np.uint64)
+        uptime = np.empty(rows, np.int32)
         index: dict[str, int] = {}
         at = 0
         for batch in batches:
             end = at + batch.num_rows
             stamped = pc.cast(batch.column("time"), pa.timestamp("us", tz="UTC"))
-            d.time_us[at:end] = stamped.cast(pa.int64()).to_numpy()
+            time_us[at:end] = stamped.cast(pa.int64()).to_numpy()
             names = batch.column("subject").to_pylist()
             payloads = batch.column("payload").to_pylist()
-            d.subject[at:end] = [index.setdefault(s, len(index)) for s in names]
-            d.uptime[at:end] = [
+            subject[at:end] = [index.setdefault(s, len(index)) for s in names]
+            uptime[at:end] = [
                 json.loads(p)["uptime_sec"] if s == heartbeat else -1
                 for s, p in zip(names, payloads, strict=True)
             ]
             digest = b"".join(
                 hashlib.blake2b(p.encode(), digest_size=16).digest() for p in payloads
             )
-            d.content[at:end] = np.frombuffer(digest, dtype="<u8").reshape(-1, 2)
+            content[at:end] = np.frombuffer(digest, dtype="<u8").reshape(-1, 2)
             at = end
         if at != rows:
             raise RuntimeError(f"read {at} rows, expected {rows}")
-        return cls(d.time_us, d.subject, d.content, d.uptime, tuple(index))
+        return cls(time_us, subject, content, uptime, tuple(index))
 
 
 def _subject_ids(d: Deliveries, names: Iterable[str]) -> list[int]:
@@ -143,17 +140,17 @@ class _Payloads:
 
 
 def _payloads(d: Deliveries) -> _Payloads:
-    """Sort the rows once by subject and payload, then time; lexsort keeps ties in file order."""
+    """Per row, its place among the rows of its subject and payload, ties in file order."""
     order = np.lexsort((d.time_us, d.content[:, 1], d.content[:, 0], d.subject))
     first = np.concatenate(
         [[True], ~_same_as_previous(order, [d.subject, d.content[:, 0], d.content[:, 1]])]
     )
     at = d.time_us[order]
     day = at // DAY_US
-    first_of_day = first.copy()
-    first_of_day[1:] |= day[1:] != day[:-1]
+    first_in_day = first.copy()
+    first_in_day[1:] |= day[1:] != day[:-1]
     del day
-    same_time = np.concatenate([[False], ~first[1:] & (at[1:] == at[:-1])])
+    identical = np.concatenate([[False], ~first[1:] & (at[1:] == at[:-1])])
     last_of_payload = np.flatnonzero(np.concatenate([first[1:], [True]]))
     last_at = at[last_of_payload][np.cumsum(first) - 1]
     del at, last_of_payload
@@ -163,7 +160,7 @@ def _payloads(d: Deliveries) -> _Payloads:
         values[order] = sorted_values
         return values
 
-    return _Payloads(by_row(first), by_row(first_of_day), by_row(same_time), by_row(last_at))
+    return _Payloads(by_row(first), by_row(first_in_day), by_row(identical), by_row(last_at))
 
 
 def _block_open_until(d: Deliveries) -> npt.NDArray[np.int64]:
@@ -382,11 +379,20 @@ def classify(d: Deliveries, rules: Rules) -> npt.NDArray[np.int8]:
 
 
 def payloads_lost(d: Deliveries, keep: npt.NDArray[np.bool_]) -> int:
-    """How many payloads of a subject would keep none of their rows."""
-    order = np.lexsort((d.content[:, 1], d.content[:, 0], d.subject))
+    """How many payloads of a subject on a UTC day keep no row that day or the day before.
+
+    A copy is delivered within minutes of its original, so one past midnight may go.
+    """
+    day = d.time_us // DAY_US
+    order = np.lexsort((day, d.content[:, 1], d.content[:, 0], d.subject))
     same = _same_as_previous(order, [d.subject, d.content[:, 0], d.content[:, 1]])
-    starts = np.flatnonzero(np.concatenate([[True], ~same]))
-    return int(np.count_nonzero(~np.logical_or.reduceat(keep[order], starts)))
+    day = day[order]
+    starts = np.flatnonzero(np.concatenate([[True], ~(same & (day[1:] == day[:-1]))]))
+    kept = np.logical_or.reduceat(keep[order], starts)
+    day = day[starts]
+    covered = kept.copy()
+    covered[1:] |= same[starts[1:] - 1] & kept[:-1] & (day[1:] == day[:-1] + 1)
+    return int(np.count_nonzero(~covered))
 
 
 def tally(d: Deliveries, reasons: npt.NDArray[np.int8]) -> list[dict[str, str | int]]:

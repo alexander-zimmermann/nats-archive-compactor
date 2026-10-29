@@ -179,7 +179,7 @@ def test_the_switch_dedupes_only_the_named_streams_and_nothing_else(
 def test_the_switch_without_named_streams_touches_nothing(
     store: Store, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Discovery would include ems_esp and warp_*, whose May needs more than exact repeats."""
+    """Deduplication rewrites whole months, so discovering every stream is no target."""
     _rolled_up_month(store, "knx", {"02": [A, A]})
     seeded = store.keys()
     monkeypatch.setenv("COMPACT_DEDUPE_MONTH", "2026/05")
@@ -316,6 +316,30 @@ def test_a_rewrite_losing_a_payload_writes_nothing(
     monthly = "warp_system/2026/05/monthly.parquet"
     assert store.keys() == [monthly, f"{monthly}.orig"]
     assert store.table(monthly).equals(original)
+
+
+def test_a_repeat_days_later_is_no_copy_to_drop(store: Store) -> None:
+    """A clock repeating two days on is no redelivery; the month stays as it was."""
+    later = ("2026-05-12T10:00:00Z", *TICK_1[1:])
+    original = _rolled_up_month(store, "warp_system", {"10": [TICK_1], "12": [later]})
+
+    with pytest.raises(RuntimeError, match="1 payloads"):
+        _dedupe(store.client, "warp_system", "2026/05")
+
+    monthly = "warp_system/2026/05/monthly.parquet"
+    assert store.keys() == [monthly, f"{monthly}.orig"]
+    assert store.table(monthly).equals(original)
+
+
+def test_a_copy_past_midnight_goes(store: Store) -> None:
+    """Its original was delivered the day before."""
+    late = ("2026-05-10T23:59:50Z", RTC, '{"time": 9}')
+    copy = ("2026-05-11T00:00:20Z", RTC, '{"time": 9}')
+    _rolled_up_month(store, "warp_system", {"10": [late], "11": [copy]})
+
+    assert _dedupe(store.client, "warp_system", "2026/05") == "deduped"
+
+    assert _rows(store.table("warp_system/2026/05/monthly.parquet")) == [late]
 
 
 def test_a_rewrite_dropping_a_row_outside_the_window_never_replaces_the_monthly_file(
