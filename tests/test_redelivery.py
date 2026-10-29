@@ -22,7 +22,7 @@ def _deliveries(rows: list[Row], heartbeat: str | None = None) -> Deliveries:
             "payload": [payload for _, _, payload in rows],
         }
     )
-    return Deliveries.from_batches([batch], heartbeat=heartbeat)
+    return Deliveries.from_batches([batch], batch.num_rows, heartbeat=heartbeat)
 
 
 def _kept(rows: list[Row], rules: Rules, heartbeat: str | None = None) -> list[Row]:
