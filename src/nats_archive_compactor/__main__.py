@@ -16,10 +16,13 @@ from urllib.parse import urlparse
 
 import boto3
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import structlog
 from botocore.config import Config
 from botocore.exceptions import ClientError
+
+from nats_archive_compactor import redelivery
 
 if TYPE_CHECKING:
     from mypy_boto3_s3 import S3Client
@@ -36,7 +39,11 @@ MONTHLY_BACKUP = "monthly.parquet.orig"  # a deduplicated month's file as it was
 MONTHLY_REWRITE = "monthly.parquet.new"  # a deduplicated month's file until it is verified
 ARCHIVE_COLUMNS = ("payload", "subject", "time")  # the column order the archive writes today
 ROW_FIELDS = ("time", "subject", "payload")  # what makes rows identical
-REDELIVERY_DAYS = ("2026/05/01", "2026/05/27")  # NATS redelivered every message every 30 s
+# The file days of the window in which NATS redelivered every message after 30 s.
+REDELIVERY_DAYS = tuple(
+    dt.datetime.fromtimestamp(us / 1e6, dt.UTC).strftime("%Y/%m/%d")
+    for us in (redelivery.WINDOW_START_US, redelivery.WINDOW_END_US)
+)
 FILE_BUFFER_BYTES = 1 << 20  # read buffer for a local Parquet file
 
 _HOUR_FILE = re.compile(r"\d{2}/[^/]+\.parquet")
@@ -462,8 +469,64 @@ def _verify_deduped(
         raise RuntimeError("the rewrite holds rows the original does not")
 
 
+def _day_subjects(batch: pa.RecordBatch) -> Iterator[tuple[str, str]]:
+    """Each row's UTC day of its time, and its subject."""
+    stamped = pc.cast(batch.column("time"), pa.timestamp("us", tz="UTC"))
+    days = pc.strftime(stamped, format="%Y-%m-%d").to_pylist()
+    return zip(days, batch.column("subject").to_pylist(), strict=True)
+
+
+def _count_exact(source: str, month: str) -> list[dict[str, str | int]]:
+    """Per UTC day of the row time and subject: rows, and rows identical to one kept."""
+    rows: Counter[tuple[str, str]] = Counter()
+    kept: Counter[tuple[str, str]] = Counter()
+
+    def counted(
+        pieces: Iterator[tuple[str, pa.RecordBatch]],
+    ) -> Iterator[tuple[str, pa.RecordBatch]]:
+        for day, batch in pieces:
+            rows.update(_day_subjects(batch))
+            yield day, batch
+
+    days = _recorded_days(pq.read_metadata(source))
+    for _, first in _first_rows(counted(_day_batches(source, days)), month):
+        kept.update(_day_subjects(first))
+    report: list[dict[str, str | int]] = []
+    for (day, subject), n in sorted(rows.items()):
+        k = kept[(day, subject)]
+        report.append({"day": day, "subject": subject, "rows": n, "kept": k, "identical": n - k})
+    return report
+
+
+def _count_copies(source: str, stream: str) -> list[dict[str, str | int]]:
+    """Per UTC day of the row time and subject: rows, kept and dropped per reason."""
+    rules = redelivery.RULES[stream]
+    reader = pq.ParquetFile(source, pre_buffer=False, buffer_size=FILE_BUFFER_BYTES)
+    batches = reader.iter_batches(batch_size=ROLLUP_BATCH_ROWS)
+    deliveries = redelivery.Deliveries.from_batches(batches, rules.heartbeat)
+    return redelivery.tally(deliveries, redelivery.classify(deliveries, rules))
+
+
+def _count(client: S3Client, stream: str, month: str) -> str:
+    """Log per day and subject what deduplicating the month would drop; write nothing."""
+    prefix = f"{stream}/{month}/"
+    backup = f"{prefix}{MONTHLY_BACKUP}"
+    # The source a rewrite reads: the original once a rewrite replaced it.
+    source_key = backup if _exists(client, backup) else f"{prefix}monthly.parquet"
+    with _downloaded(client, source_key) as source:
+        if stream in redelivery.RULES:
+            lines = _count_copies(source, stream)
+        else:
+            lines = _count_exact(source, month)
+    for line in lines:
+        log.info("compaction.dedupe.day", stream=stream, month=month, **line)
+    return "counted"
+
+
 def _dedupe(client: S3Client, stream: str, month: str) -> str:
     """Rewrite the month's monthly file without repeats; the original stays beside it."""
+    if stream in redelivery.RULES:
+        raise RuntimeError(f"{stream} is stamped at delivery; only a dry run handles its month")
     prefix = f"{stream}/{month}/"
     monthly = f"{prefix}monthly.parquet"
     backup = f"{prefix}{MONTHLY_BACKUP}"
@@ -513,6 +576,7 @@ def main() -> None:
     explicit_day = os.environ.get("COMPACT_DAY")
     day = explicit_day or (now - dt.timedelta(days=1)).strftime("%Y/%m/%d")
     dedupe_month = os.environ.get("COMPACT_DEDUPE_MONTH")
+    dry_run = os.environ.get("COMPACT_DEDUPE_DRY_RUN", "0").strip()
     # An explicit day names exactly one target, so backfill and rollup only apply without it.
     backfill = 0 if explicit_day else int(os.environ.get("COMPACT_BACKFILL_DAYS", "0"))
     rollup = 0 if explicit_day else int(os.environ.get("COMPACT_ROLLUP_MONTHS", "0"))
@@ -523,6 +587,13 @@ def main() -> None:
     if dedupe_month and not os.environ.get("COMPACT_STREAMS", "").strip():
         log.error("compaction.start", error="COMPACT_DEDUPE_MONTH needs COMPACT_STREAMS")
         sys.exit(1)
+    if dry_run not in ("0", "1"):
+        log.error("compaction.start", error="COMPACT_DEDUPE_DRY_RUN is 0 or 1")
+        sys.exit(1)
+    # Compaction and rollup write, so a dry run without a month to count is no dry run.
+    if dry_run == "1" and not dedupe_month:
+        log.error("compaction.start", error="COMPACT_DEDUPE_DRY_RUN needs COMPACT_DEDUPE_MONTH")
+        sys.exit(1)
 
     client = _build_client()
     streams = _resolve_streams(client)
@@ -532,6 +603,7 @@ def main() -> None:
         backfill_days=backfill,
         rollup_months=rollup,
         dedupe_month=dedupe_month,
+        dry_run=dry_run == "1",
         streams=list(streams),
     )
 
@@ -559,7 +631,7 @@ def main() -> None:
     for stream in streams:
         # Deduplicating a month is the run's only job.
         if dedupe_month:
-            run(_dedupe, stream, "month", dedupe_month)
+            run(_count if dry_run == "1" else _dedupe, stream, "month", dedupe_month)
             continue
 
         try:
@@ -582,7 +654,7 @@ def main() -> None:
                 rolled += 1
 
     summary = (
-        {"month": dedupe_month, "deduped": statuses["deduped"]}
+        {"month": dedupe_month, "deduped": statuses["deduped"], "counted": statuses["counted"]}
         if dedupe_month
         else {"day": day, "compacted": statuses["compacted"], "rolled_up": statuses["rolled-up"]}
     )
