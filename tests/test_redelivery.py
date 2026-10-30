@@ -161,6 +161,33 @@ def test_a_repeat_across_a_place_a_full_batch_could_have_ended_stays() -> None:
     assert (31.0, TEMPERATURE, "33") in _kept(rows, WARP)
 
 
+def test_batches_in_the_file_in_random_order_still_show_their_ends() -> None:
+    """A later batch written before an earlier one: time jumps back where the second begins."""
+    later = _filler(100, 160)
+    earlier = sorted(_filler(0, 60) + [(0.5, TEMPERATURE, "33"), (30.5, TEMPERATURE, "33")])
+
+    assert (30.5, TEMPERATURE, "33") not in _kept(later + earlier, WARP)
+
+
+def test_a_piece_spanning_the_timer_period_proves_nothing() -> None:
+    rows = sorted(_filler(0, 901) + [(0.5, TEMPERATURE, "33"), (30.5, TEMPERATURE, "33")])
+
+    assert (30.5, TEMPERATURE, "33") in _kept(rows, WARP)
+
+
+def test_a_run_in_which_the_timer_fired_twice_proves_nothing() -> None:
+    """A run shorter than a batch ends where the timer fired. A run reaching back past the
+    firing before that holds two timer-ended batches, which the 2,000-row cuts cannot tell."""
+    repeat = [(110.5, TEMPERATURE, "33"), (140.5, TEMPERATURE, "33")]
+    copy = repeat[1]
+    timer_ended = _filler(1900, 1910)
+    two = sorted(_filler(100, 1010, step=0.4) + repeat) + timer_ended
+    one = sorted(_filler(110, 1010, step=0.4) + repeat) + timer_ended
+
+    assert copy in _kept(two, WARP)
+    assert copy not in _kept(one, WARP)
+
+
 def test_identical_rows_keep_one() -> None:
     """Two deliveries stamped in the same microsecond hold nothing the other does not."""
     twin = (0.5, TEMPERATURE, "33")

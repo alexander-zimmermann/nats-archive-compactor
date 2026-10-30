@@ -33,14 +33,13 @@ def _micros(moment: dt.datetime) -> int:
 WINDOW_START_US = _micros(dt.datetime(2026, 5, 1, tzinfo=dt.UTC))
 # The last redelivery after 30 s arrived at 19:51:06 UTC.
 WINDOW_END_US = _micros(dt.datetime(2026, 5, 27, 19, 52, tzinfo=dt.UTC))
-# From here on the archive holds each batch's rows together in arrival order, and a batch ended
-# after BATCH_ROWS rows or when the output's BATCH_PERIOD_US timer fired.
-FILE_ORDER_START_US = _micros(dt.datetime(2026, 5, 2, tzinfo=dt.UTC))
-
 ACK_WAIT_US = 30 * SECOND_US  # NATS redelivered a message this long after its last delivery
 EARLY_US, LATE_US = 1 * SECOND_US, 6 * SECOND_US  # a redelivery's processing before or after due
+# The archive output wrote a batch after this many rows or when its timer fired, every period.
 BATCH_ROWS = 2_000
 BATCH_PERIOD_US = 900 * SECOND_US
+TIMER_SLACK_US = 2 * SECOND_US  # a batch ends this close before the timer fired
+NEAR_TICKS = 16  # timer firings compared on either side; the timer drifts 4 ms per period
 PERIOD_S = 10  # a periodic subject is sent once per this many seconds of device time
 PROBE_GAP_US = 2 * SECOND_US  # the widest gap between the counter rows bracketing a row
 REPLAY_CHUNK = 100_000  # rows replayed between sweeps of expired redeliveries
@@ -166,35 +165,52 @@ def _payloads(d: Deliveries) -> _Payloads:
 def _block_open_until(d: Deliveries) -> npt.NDArray[np.int64]:
     """Per row, until when its batch was certainly still collecting, or -1 if unknown.
 
-    While a batch collects, NATS redelivers each of its messages every 30 s, so a pause of more
-    than ACK_WAIT_US + LATE_US between neighbouring rows ends a batch, and so does a restart,
-    which stops deliveries for longer. A block between two such pauses holds whole batches.
-    If its rows run forward and it spans less than BATCH_PERIOD_US less that pause, at most one
-    of its batches was ended by the timer and all others hold BATCH_ROWS rows, so cutting every
-    BATCH_ROWS rows from either end finds each batch's end. Every other block proves nothing.
+    The archive holds each batch's rows together in arrival order and the batches of an hour
+    in random order, so time runs forward within a batch and jumps back between two. While a
+    batch collects, NATS redelivers each of its messages every 30 s, so a pause of more than
+    ACK_WAIT_US + LATE_US between neighbouring rows ends a batch as well. A run between such
+    cuts holds whole batches that followed each other, each of BATCH_ROWS rows unless the timer
+    ended it, so cutting every BATCH_ROWS rows from either end finds each batch's end, as long
+    as the timer ended at most one of them. The timer fires every BATCH_PERIOD_US and a run
+    shorter than a batch ends where it fired, so a run within which it fired twice proves
+    nothing; nor does a piece spanning a period.
     """
     n = len(d.time_us)
     open_until = np.full(n, -1, np.int64)
     pause = ACK_WAIT_US + LATE_US
     step = np.diff(d.time_us)
-    bounds = [0, *(np.flatnonzero(step > pause) + 1).tolist(), n]
-    backwards = np.flatnonzero(step < -SECOND_US) + 1
-    for start, end in zip(bounds, bounds[1:], strict=False):
-        block = d.time_us[start:end]
-        runs_back = np.searchsorted(backwards, start, "right") < np.searchsorted(backwards, end)
-        if (
-            runs_back
-            or block.min() < FILE_ORDER_START_US
-            or block.max() - block.min() >= BATCH_PERIOD_US - pause
-        ):
+    bounds = [0, *(np.flatnonzero((step > pause) | (step < -SECOND_US)) + 1).tolist(), n]
+    runs = [
+        (start, end, int(d.time_us[start:end].min()), int(d.time_us[start:end].max()))
+        for start, end in zip(bounds, bounds[1:], strict=False)
+        if d.time_us[start:end].min() >= WINDOW_START_US
+    ]
+    fired = np.array(sorted(last for start, end, _, last in runs if end - start < BATCH_ROWS))
+    for start, end, first, last in runs:
+        if last - first >= BATCH_PERIOD_US - pause and _timer_fired_twice(first, last, fired):
             continue
         cuts = sorted(
             {start, end, *range(start + BATCH_ROWS, end, BATCH_ROWS)}
             | set(range(end - BATCH_ROWS, start, -BATCH_ROWS))
         )
         for a, b in zip(cuts, cuts[1:], strict=False):
-            open_until[a:b] = d.time_us[a:b].max()
+            piece = d.time_us[a:b]
+            if piece.max() - piece.min() < BATCH_PERIOD_US:
+                open_until[a:b] = piece.max()
     return open_until
+
+
+def _timer_fired_twice(first: int, last: int, fired: npt.NDArray[np.int64]) -> bool:
+    """Whether the timer fired at least twice after `first` by `last`, give or take the slack.
+
+    `fired` holds moments it fired, in order; each one, shifted by whole periods, marks the
+    firings around it.
+    """
+    reach = NEAR_TICKS * BATCH_PERIOD_US
+    lo, hi = np.searchsorted(fired, [last - reach, last + reach])
+    moments = fired[lo:hi, None] + BATCH_PERIOD_US * np.arange(-NEAR_TICKS, NEAR_TICKS + 1)
+    within = (moments > first + TIMER_SLACK_US) & (moments <= last + TIMER_SLACK_US)
+    return bool(np.any(within.sum(axis=1) >= 2))
 
 
 def _probe_open_until(
@@ -210,7 +226,7 @@ def _probe_open_until(
     """
     n = len(d.time_us)
     open_until = np.full(n, -1, np.int64)
-    rows = np.flatnonzero(counters & (d.time_us >= FILE_ORDER_START_US))
+    rows = np.flatnonzero(counters & (d.time_us >= WINDOW_START_US))
     if not len(rows):
         return open_until
     last = last_at[rows]
