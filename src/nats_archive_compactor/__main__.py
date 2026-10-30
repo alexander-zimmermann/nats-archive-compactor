@@ -15,6 +15,8 @@ from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
 import boto3
+import numpy as np
+import numpy.typing as npt
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
@@ -368,6 +370,13 @@ def _batch_digests(batch: pa.RecordBatch) -> list[bytes]:
     ]
 
 
+def _day_digests(path: str, days: dict[str, int]) -> Iterator[tuple[str, bytes]]:
+    """Each row of a local monthly file with its recorded day and identity, in file order."""
+    for day, batch in _day_batches(path, days):
+        for digest in _batch_digests(batch):
+            yield day, digest
+
+
 def _day_after(day: str, before: str | None) -> bool:
     """Whether `day` directly follows `before` within the month."""
     return before is not None and int(day) == int(before) + 1
@@ -405,10 +414,24 @@ def _first_rows(
         yield day, batch.filter(pa.array(keep, pa.bool_()))
 
 
-def _write_deduped(
-    client: S3Client, source: str, month: str, days: dict[str, int], key: str
+def _kept_batches(
+    batches: Iterator[tuple[str, pa.RecordBatch]], keep: npt.NDArray[np.bool_]
+) -> Iterator[tuple[str, pa.RecordBatch]]:
+    """The batches, which run through the file in order, cut to the rows `keep` marks."""
+    start = 0
+    for day, batch in batches:
+        yield day, batch.filter(pa.array(keep[start : start + batch.num_rows]))
+        start += batch.num_rows
+
+
+def _write_batches(
+    client: S3Client,
+    source: str,
+    pieces: Iterator[tuple[str, pa.RecordBatch]],
+    days: dict[str, int],
+    key: str,
 ) -> dict[str, int]:
-    """Upload the local monthly file without repeats to `key`; return each day's rows.
+    """Upload the pieces of the local monthly file to `key`; return each day's rows.
 
     The columns come out in the order the archive writes today.
     """
@@ -417,7 +440,7 @@ def _write_deduped(
     kept = dict.fromkeys(days, 0)
     with tempfile.NamedTemporaryFile(suffix=".parquet") as tmp:
         with pq.ParquetWriter(tmp.name, schema, compression="zstd") as writer:
-            for day, batch in _first_rows(_day_batches(source, days), month):
+            for day, batch in pieces:
                 if batch.num_rows:
                     writer.write_batch(_conform(batch, schema))
                     kept[day] += batch.num_rows
@@ -434,21 +457,12 @@ def _verify_deduped(
     A row may be left out only on a redelivery day and only beside an identical row kept on
     the same or the previous day.
     """
-    footer = pq.read_metadata(written)
-    if _recorded_days(footer) != kept or footer.num_rows != sum(kept.values()):
-        raise RuntimeError(f"rewrite holds {footer.num_rows} rows, recorded {kept}")
-    names = footer.schema.to_arrow_schema().names
-    if tuple(names) != ARCHIVE_COLUMNS:
-        raise RuntimeError(f"rewrite has columns {names}")
+    _check_rewrite_footer(written, kept)
     for day, rows in days.items():
         if not _redelivered(month, day) and kept[day] != rows:
             raise RuntimeError(f"day {day} has {kept[day]} rows, the original {rows}")
 
-    output = (
-        (day, digest)
-        for day, batch in _day_batches(written, kept)
-        for digest in _batch_digests(batch)
-    )
+    output = _day_digests(written, kept)
     ahead = next(output, None)
     previous: set[bytes] = set()
     current: set[bytes] = set()
@@ -466,6 +480,52 @@ def _verify_deduped(
             elif digest not in current and digest not in previous:
                 raise RuntimeError(f"row {number} of the original is missing from the rewrite")
     if ahead is not None:
+        raise RuntimeError("the rewrite holds rows the original does not")
+
+
+def _check_rewrite_footer(written: str, kept: dict[str, int]) -> None:
+    """Raise unless the written file records the rows kept and has the archive's columns."""
+    footer = pq.read_metadata(written)
+    if _recorded_days(footer) != kept or footer.num_rows != sum(kept.values()):
+        raise RuntimeError(f"rewrite holds {footer.num_rows} rows, recorded {kept}")
+    names = footer.schema.to_arrow_schema().names
+    if tuple(names) != ARCHIVE_COLUMNS:
+        raise RuntimeError(f"rewrite has columns {names}")
+
+
+def _times_us(batch: pa.RecordBatch) -> npt.NDArray[np.int64]:
+    """Each row's time in microseconds since the epoch."""
+    stamped = pc.cast(batch.column("time"), pa.timestamp("us", tz="UTC"))
+    return np.asarray(stamped.cast(pa.int64()).to_numpy(), np.int64)
+
+
+def _verify_kept(
+    source: str,
+    written: str,
+    days: dict[str, int],
+    keep: npt.NDArray[np.bool_],
+    kept: dict[str, int],
+) -> None:
+    """Raise unless the written file holds exactly the source's rows `keep` marks, in order.
+
+    A row may be left out only inside the redelivery window.
+    """
+    _check_rewrite_footer(written, kept)
+    output = _day_digests(written, kept)
+    number = 0
+    for day, batch in _day_batches(source, days):
+        stays = keep[number : number + batch.num_rows]
+        times = _times_us(batch)
+        outside = (times < redelivery.WINDOW_START_US) | (times >= redelivery.WINDOW_END_US)
+        for digest, kept_row, out in zip(
+            _batch_digests(batch), stays.tolist(), outside.tolist(), strict=True
+        ):
+            number += 1
+            if kept_row and next(output, None) != (day, digest):
+                raise RuntimeError(f"row {number} of the original is missing from the rewrite")
+            if not kept_row and out:
+                raise RuntimeError(f"row {number} of the original lies outside the window")
+    if number != len(keep) or next(output, None) is not None:
         raise RuntimeError("the rewrite holds rows the original does not")
 
 
@@ -498,13 +558,35 @@ def _count_exact(source: str, month: str) -> list[dict[str, str | int]]:
     return report
 
 
-def _count_copies(source: str, stream: str) -> list[dict[str, str | int]]:
-    """Per UTC day of the row time and subject: rows, kept and dropped per reason."""
+def _classified(source: str, stream: str) -> tuple[redelivery.Deliveries, npt.NDArray[np.int8]]:
+    """The local monthly file's deliveries and why each row goes, by the stream's rules."""
     rules = redelivery.RULES[stream]
     reader = pq.ParquetFile(source, pre_buffer=False, buffer_size=FILE_BUFFER_BYTES)
     batches = reader.iter_batches(batch_size=ROLLUP_BATCH_ROWS)
-    deliveries = redelivery.Deliveries.from_batches(batches, rules.heartbeat)
-    return redelivery.tally(deliveries, redelivery.classify(deliveries, rules))
+    deliveries = redelivery.Deliveries.from_batches(
+        batches, reader.metadata.num_rows, rules.heartbeat
+    )
+    return deliveries, redelivery.classify(deliveries, rules)
+
+
+def _log_day_lines(stream: str, month: str, lines: list[dict[str, str | int]]) -> None:
+    """Log one compaction.dedupe.day line per UTC day and subject."""
+    for line in lines:
+        log.info("compaction.dedupe.day", stream=stream, month=month, **line)
+
+
+def _rows_kept(source: str, stream: str, month: str) -> npt.NDArray[np.bool_]:
+    """Which rows of the local monthly file are no proven copy; logs the dry run's lines.
+
+    Each payload of a subject must keep a row, or nothing is written.
+    """
+    deliveries, reasons = _classified(source, stream)
+    _log_day_lines(stream, month, redelivery.tally(deliveries, reasons))
+    keep: npt.NDArray[np.bool_] = reasons == redelivery.Reason.KEPT
+    lost = redelivery.payloads_lost(deliveries, keep)
+    if lost:
+        raise RuntimeError(f"{lost} payloads would lose every row")
+    return keep
 
 
 def _count(client: S3Client, stream: str, month: str) -> str:
@@ -515,18 +597,15 @@ def _count(client: S3Client, stream: str, month: str) -> str:
     source_key = backup if _exists(client, backup) else f"{prefix}monthly.parquet"
     with _downloaded(client, source_key) as source:
         if stream in redelivery.RULES:
-            lines = _count_copies(source, stream)
+            lines = redelivery.tally(*_classified(source, stream))
         else:
             lines = _count_exact(source, month)
-    for line in lines:
-        log.info("compaction.dedupe.day", stream=stream, month=month, **line)
+    _log_day_lines(stream, month, lines)
     return "counted"
 
 
 def _dedupe(client: S3Client, stream: str, month: str) -> str:
-    """Rewrite the month's monthly file without repeats; the original stays beside it."""
-    if stream in redelivery.RULES:
-        raise RuntimeError(f"{stream} is stamped at delivery; only a dry run handles its month")
+    """Rewrite the month's monthly file without copies; the original stays beside it."""
     prefix = f"{stream}/{month}/"
     monthly = f"{prefix}monthly.parquet"
     backup = f"{prefix}{MONTHLY_BACKUP}"
@@ -535,10 +614,19 @@ def _dedupe(client: S3Client, stream: str, month: str) -> str:
         _copy(client, monthly, backup)
     with _downloaded(client, backup) as source:
         days = _recorded_days(pq.read_metadata(source))
+        # The streams stamped at delivery drop what the rules prove; the others exact repeats.
+        keep = _rows_kept(source, stream, month) if stream in redelivery.RULES else None
         try:
-            kept = _write_deduped(client, source, month, days, rewrite)
+            if keep is not None:
+                pieces = _kept_batches(_day_batches(source, days), keep)
+            else:
+                pieces = _first_rows(_day_batches(source, days), month)
+            kept = _write_batches(client, source, pieces, days, rewrite)
             with _downloaded(client, rewrite) as written:
-                _verify_deduped(source, written, month, days, kept)
+                if keep is not None:
+                    _verify_kept(source, written, days, keep, kept)
+                else:
+                    _verify_deduped(source, written, month, days, kept)
         except Exception:
             # An unverified rewrite never replaces the monthly file.
             _delete_keys(client, [rewrite])
@@ -583,7 +671,7 @@ def main() -> None:
     # A month is rolled up once the month after it is over, i.e. when it is older than last month.
     last_month = _last_month(now)
 
-    # Discovery would include streams whose repeats are not exact, so deduplication names its own.
+    # Deduplication rewrites whole months, so it runs only on the streams named.
     if dedupe_month and not os.environ.get("COMPACT_STREAMS", "").strip():
         log.error("compaction.start", error="COMPACT_DEDUPE_MONTH needs COMPACT_STREAMS")
         sys.exit(1)

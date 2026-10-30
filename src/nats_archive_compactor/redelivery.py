@@ -15,6 +15,7 @@ from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import IntEnum
+from typing import Any
 
 import numpy as np
 import numpy.typing as npt
@@ -32,17 +33,17 @@ def _micros(moment: dt.datetime) -> int:
 WINDOW_START_US = _micros(dt.datetime(2026, 5, 1, tzinfo=dt.UTC))
 # The last redelivery after 30 s arrived at 19:51:06 UTC.
 WINDOW_END_US = _micros(dt.datetime(2026, 5, 27, 19, 52, tzinfo=dt.UTC))
-# From here on the archive holds each batch's rows together in arrival order, and a batch ended
-# after BATCH_ROWS rows or when the output's BATCH_PERIOD_US timer fired.
-FILE_ORDER_START_US = _micros(dt.datetime(2026, 5, 2, tzinfo=dt.UTC))
-
 ACK_WAIT_US = 30 * SECOND_US  # NATS redelivered a message this long after its last delivery
 EARLY_US, LATE_US = 1 * SECOND_US, 6 * SECOND_US  # a redelivery's processing before or after due
+# The archive output wrote a batch after this many rows or when its timer fired, every period.
 BATCH_ROWS = 2_000
 BATCH_PERIOD_US = 900 * SECOND_US
+TIMER_SLACK_US = 2 * SECOND_US  # a batch ends this close before the timer fired
+NEAR_TICKS = 16  # timer firings compared on either side; the timer drifts 4 ms per period
 PERIOD_S = 10  # a periodic subject is sent once per this many seconds of device time
 PROBE_GAP_US = 2 * SECOND_US  # the widest gap between the counter rows bracketing a row
 REPLAY_CHUNK = 100_000  # rows replayed between sweeps of expired redeliveries
+PROBE_CHUNK = 1_000_000  # rows whose neighbouring counter rows are looked up at a time
 
 
 class Reason(IntEnum):
@@ -69,47 +70,41 @@ class Deliveries:
     """One month of a stream in file order, reduced to what telling copies apart needs."""
 
     time_us: npt.NDArray[np.int64]  # since the epoch
-    subject: npt.NDArray[np.int32]  # index into subjects
+    subject: npt.NDArray[np.int16]  # index into subjects
     content: npt.NDArray[np.uint64]  # 128-bit digest of the payload, two words per row
-    uptime: npt.NDArray[np.int64]  # a heartbeat's uptime_sec, -1 for every other row
+    uptime: npt.NDArray[np.int32]  # a heartbeat's uptime_sec, -1 for every other row
     subjects: tuple[str, ...]
 
     @classmethod
     def from_batches(
-        cls, batches: Iterable[pa.RecordBatch], heartbeat: str | None = None
+        cls, batches: Iterable[pa.RecordBatch], rows: int, heartbeat: str | None = None
     ) -> Deliveries:
-        """The archive's time, subject and payload columns, batch by batch."""
-        times: list[npt.NDArray[np.int64]] = []
-        subjects: list[npt.NDArray[np.int32]] = []
-        uptimes: list[npt.NDArray[np.int64]] = []
-        digests: list[npt.NDArray[np.uint64]] = []
+        """The archive's time, subject and payload columns of `rows` rows, batch by batch."""
+        time_us = np.empty(rows, np.int64)
+        subject = np.empty(rows, np.int16)
+        content = np.empty((rows, 2), np.uint64)
+        uptime = np.empty(rows, np.int32)
         index: dict[str, int] = {}
+        at = 0
         for batch in batches:
+            end = at + batch.num_rows
             stamped = pc.cast(batch.column("time"), pa.timestamp("us", tz="UTC"))
-            times.append(stamped.cast(pa.int64()).to_numpy())
+            time_us[at:end] = stamped.cast(pa.int64()).to_numpy()
             names = batch.column("subject").to_pylist()
             payloads = batch.column("payload").to_pylist()
-            subjects.append(np.fromiter((index.setdefault(s, len(index)) for s in names), np.int32))
-            uptimes.append(
-                np.fromiter(
-                    (
-                        json.loads(p)["uptime_sec"] if s == heartbeat else -1
-                        for s, p in zip(names, payloads, strict=True)
-                    ),
-                    np.int64,
-                )
-            )
+            subject[at:end] = [index.setdefault(s, len(index)) for s in names]
+            uptime[at:end] = [
+                json.loads(p)["uptime_sec"] if s == heartbeat else -1
+                for s, p in zip(names, payloads, strict=True)
+            ]
             digest = b"".join(
                 hashlib.blake2b(p.encode(), digest_size=16).digest() for p in payloads
             )
-            digests.append(np.frombuffer(digest, dtype="<u8").reshape(-1, 2))
-        return cls(
-            time_us=np.concatenate(times),
-            subject=np.concatenate(subjects),
-            content=np.concatenate(digests),
-            uptime=np.concatenate(uptimes),
-            subjects=tuple(index),
-        )
+            content[at:end] = np.frombuffer(digest, dtype="<u8").reshape(-1, 2)
+            at = end
+        if at != rows:
+            raise RuntimeError(f"read {at} rows, expected {rows}")
+        return cls(time_us, subject, content, uptime, tuple(index))
 
 
 def _subject_ids(d: Deliveries, names: Iterable[str]) -> list[int]:
@@ -122,65 +117,105 @@ def _rows_of(d: Deliveries, names: Iterable[str]) -> npt.NDArray[np.bool_]:
     return np.isin(d.subject, _subject_ids(d, names))
 
 
-def _earliest(d: Deliveries, *, per_day: bool) -> npt.NDArray[np.bool_]:
-    """Whether each row is the earliest of its subject and payload, in the month or its day."""
-    day = d.time_us // DAY_US if per_day else np.zeros(len(d.time_us), np.int64)
-    order = np.lexsort(
-        (np.arange(len(d.time_us)), d.time_us, d.content[:, 1], d.content[:, 0], d.subject, day)
-    )
-    key = np.stack([day[order], d.subject[order], d.content[order, 0], d.content[order, 1]])
-    earliest = np.zeros(len(d.time_us), np.bool_)
-    earliest[order[:1]] = True
-    earliest[order[1:][np.any(key[:, 1:] != key[:, :-1], axis=0)]] = True
-    return earliest
+def _same_as_previous(
+    order: npt.NDArray[np.intp], columns: list[npt.NDArray[Any]]
+) -> npt.NDArray[np.bool_]:
+    """Whether each row in `order` but the first equals the row before it in every column."""
+    same = np.ones(max(len(order) - 1, 0), np.bool_)
+    for column in columns:
+        values = column[order]
+        same &= values[1:] == values[:-1]
+    return same
 
 
-def _identical_to_earlier(d: Deliveries) -> npt.NDArray[np.bool_]:
-    """Rows equal in time, subject and payload to an earlier row."""
-    order = np.lexsort(
-        (np.arange(len(d.time_us)), d.content[:, 1], d.content[:, 0], d.subject, d.time_us)
+@dataclass(frozen=True)
+class _Payloads:
+    """Per row, what the other deliveries of its subject and payload say about it."""
+
+    first_in_month: npt.NDArray[np.bool_]  # the earliest of them
+    first_in_day: npt.NDArray[np.bool_]  # the earliest of them on its UTC day
+    identical: npt.NDArray[np.bool_]  # equal in time to an earlier one
+    last_at: npt.NDArray[np.int64]  # when the last of them arrived
+
+
+def _payloads(d: Deliveries) -> _Payloads:
+    """Per row, its place among the rows of its subject and payload, ties in file order."""
+    order = np.lexsort((d.time_us, d.content[:, 1], d.content[:, 0], d.subject))
+    first = np.concatenate(
+        [[True], ~_same_as_previous(order, [d.subject, d.content[:, 0], d.content[:, 1]])]
     )
-    key = np.stack([d.time_us[order], d.subject[order], d.content[order, 0], d.content[order, 1]])
-    again = np.zeros(len(d.time_us), np.bool_)
-    again[order[1:][np.all(key[:, 1:] == key[:, :-1], axis=0)]] = True
-    return again
+    at = d.time_us[order]
+    day = at // DAY_US
+    first_in_day = first.copy()
+    first_in_day[1:] |= day[1:] != day[:-1]
+    del day
+    identical = np.concatenate([[False], ~first[1:] & (at[1:] == at[:-1])])
+    last_of_payload = np.flatnonzero(np.concatenate([first[1:], [True]]))
+    last_at = at[last_of_payload][np.cumsum(first) - 1]
+    del at, last_of_payload
+
+    def by_row(sorted_values: npt.NDArray[Any]) -> npt.NDArray[Any]:
+        values = np.empty_like(sorted_values)
+        values[order] = sorted_values
+        return values
+
+    return _Payloads(by_row(first), by_row(first_in_day), by_row(identical), by_row(last_at))
 
 
 def _block_open_until(d: Deliveries) -> npt.NDArray[np.int64]:
     """Per row, until when its batch was certainly still collecting, or -1 if unknown.
 
-    While a batch collects, NATS redelivers each of its messages every 30 s, so a pause of more
-    than ACK_WAIT_US + LATE_US between neighbouring rows ends a batch, and so does a restart,
-    which stops deliveries for longer. A block between two such pauses holds whole batches.
-    If its rows run forward and it spans less than BATCH_PERIOD_US less that pause, at most one
-    of its batches was ended by the timer and all others hold BATCH_ROWS rows, so cutting every
-    BATCH_ROWS rows from either end finds each batch's end. Every other block proves nothing.
+    The archive holds each batch's rows together in arrival order and the batches of an hour
+    in random order, so time runs forward within a batch and jumps back between two. While a
+    batch collects, NATS redelivers each of its messages every 30 s, so a pause of more than
+    ACK_WAIT_US + LATE_US between neighbouring rows ends a batch as well. A run between such
+    cuts holds whole batches that followed each other, each of BATCH_ROWS rows unless the timer
+    ended it, so cutting every BATCH_ROWS rows from either end finds each batch's end, as long
+    as the timer ended at most one of them. The timer fires every BATCH_PERIOD_US and a run
+    shorter than a batch ends where it fired, so a run within which it fired twice proves
+    nothing; nor does a piece spanning a period.
     """
     n = len(d.time_us)
     open_until = np.full(n, -1, np.int64)
     pause = ACK_WAIT_US + LATE_US
     step = np.diff(d.time_us)
-    bounds = [0, *(np.flatnonzero(step > pause) + 1).tolist(), n]
-    backwards = np.flatnonzero(step < -SECOND_US) + 1
-    for start, end in zip(bounds, bounds[1:], strict=False):
-        block = d.time_us[start:end]
-        runs_back = np.searchsorted(backwards, start, "right") < np.searchsorted(backwards, end)
-        if (
-            runs_back
-            or block.min() < FILE_ORDER_START_US
-            or block.max() - block.min() >= BATCH_PERIOD_US - pause
-        ):
+    bounds = [0, *(np.flatnonzero((step > pause) | (step < -SECOND_US)) + 1).tolist(), n]
+    runs = [
+        (start, end, int(d.time_us[start:end].min()), int(d.time_us[start:end].max()))
+        for start, end in zip(bounds, bounds[1:], strict=False)
+        if d.time_us[start:end].min() >= WINDOW_START_US
+    ]
+    fired = np.array(sorted(last for start, end, _, last in runs if end - start < BATCH_ROWS))
+    for start, end, first, last in runs:
+        if last - first >= BATCH_PERIOD_US - pause and _timer_fired_twice(first, last, fired):
             continue
         cuts = sorted(
             {start, end, *range(start + BATCH_ROWS, end, BATCH_ROWS)}
             | set(range(end - BATCH_ROWS, start, -BATCH_ROWS))
         )
         for a, b in zip(cuts, cuts[1:], strict=False):
-            open_until[a:b] = d.time_us[a:b].max()
+            piece = d.time_us[a:b]
+            if piece.max() - piece.min() < BATCH_PERIOD_US:
+                open_until[a:b] = piece.max()
     return open_until
 
 
-def _probe_open_until(d: Deliveries, counters: npt.NDArray[np.bool_]) -> npt.NDArray[np.int64]:
+def _timer_fired_twice(first: int, last: int, fired: npt.NDArray[np.int64]) -> bool:
+    """Whether the timer fired at least twice after `first` by `last`, give or take the slack.
+
+    `fired` holds moments it fired, in order; each one, shifted by whole periods, marks the
+    firings around it.
+    """
+    reach = NEAR_TICKS * BATCH_PERIOD_US
+    lo, hi = np.searchsorted(fired, [last - reach, last + reach])
+    moments = fired[lo:hi, None] + BATCH_PERIOD_US * np.arange(-NEAR_TICKS, NEAR_TICKS + 1)
+    within = (moments > first + TIMER_SLACK_US) & (moments <= last + TIMER_SLACK_US)
+    return bool(np.any(within.sum(axis=1) >= 2))
+
+
+def _probe_open_until(
+    d: Deliveries, counters: npt.NDArray[np.bool_], last_at: npt.NDArray[np.int64]
+) -> npt.NDArray[np.int64]:
     """Per row, until when its batch was certainly still collecting, shown by counter rows.
 
     A later row with a counter row's payload is that message redelivered, so no batch holding
@@ -191,31 +226,23 @@ def _probe_open_until(d: Deliveries, counters: npt.NDArray[np.bool_]) -> npt.NDA
     """
     n = len(d.time_us)
     open_until = np.full(n, -1, np.int64)
-    rows = np.flatnonzero(counters & (d.time_us >= FILE_ORDER_START_US))
+    rows = np.flatnonzero(counters & (d.time_us >= WINDOW_START_US))
     if not len(rows):
         return open_until
-    # When each counter row's message was last delivered: rows sorted by payload, then time.
-    order = rows[
-        np.lexsort((d.time_us[rows], d.content[rows, 1], d.content[rows, 0], d.subject[rows]))
-    ]
-    key = np.stack([d.subject[order], d.content[order, 0], d.content[order, 1]])
-    new_payload = np.concatenate([[True], np.any(key[:, 1:] != key[:, :-1], axis=0)])
-    last_of_payload = np.flatnonzero(np.concatenate([new_payload[1:], [True]]))
-    last = np.zeros(n, np.int64)
-    last[order] = d.time_us[order][last_of_payload][np.cumsum(new_payload) - 1]
-    redelivered = np.where(last[rows] > d.time_us[rows] + EARLY_US, last[rows] - LATE_US, -1)
-    # The counter rows before and after each row in the file.
-    before = np.searchsorted(rows, np.arange(n), "right") - 1
-    after = np.searchsorted(rows, np.arange(n), "left")
-    has = (before >= 0) & (after < len(rows))
-    i = np.flatnonzero(has)
-    b, a = before[i], after[i]
-    near = (d.time_us[rows[b]] >= d.time_us[i] - PROBE_GAP_US) & (
-        d.time_us[rows[a]] <= d.time_us[i] + PROBE_GAP_US
-    )
-    near &= d.time_us[rows[b]] <= d.time_us[i]
-    near &= d.time_us[rows[a]] >= d.time_us[i]
-    open_until[i[near]] = np.minimum(redelivered[b[near]], redelivered[a[near]])
+    last = last_at[rows]
+    redelivered = np.where(last > d.time_us[rows] + EARLY_US, last - LATE_US, -1)
+    del last
+    # The counter rows before and after each row in the file, a stretch of rows at a time.
+    for start in range(0, n, PROBE_CHUNK):
+        i = np.arange(start, min(start + PROBE_CHUNK, n))
+        b = np.searchsorted(rows, i, "right") - 1
+        a = np.searchsorted(rows, i, "left")
+        has = (b >= 0) & (a < len(rows))
+        i, b, a = i[has], b[has], a[has]
+        before_at, after_at, at = d.time_us[rows[b]], d.time_us[rows[a]], d.time_us[i]
+        near = (before_at >= at - PROBE_GAP_US) & (before_at <= at)
+        near &= (after_at <= at + PROBE_GAP_US) & (after_at >= at)
+        open_until[i[near]] = np.minimum(redelivered[b[near]], redelivered[a[near]])
     return open_until
 
 
@@ -229,7 +256,7 @@ def _after_30_s(
     Each delivery accounts for one copy; any of the identical rows can be it.
     """
     copy = np.zeros(len(d.time_us), np.bool_)
-    rows = rows[np.lexsort((rows, d.time_us[rows]))]
+    rows = rows[np.argsort(d.time_us[rows], kind="stable")]
     # Per subject and payload, the redeliveries still due: (due, batch collecting until).
     pending: dict[tuple[int, int, int], deque[tuple[int, int]]] = {}
     for start in range(0, len(rows), REPLAY_CHUNK):
@@ -269,9 +296,8 @@ def _after_30_s(
 def _beyond_device_count(
     d: Deliveries,
     rules: Rules,
-    keep: npt.NDArray[np.bool_],
+    payloads: _Payloads,
     repeats_30_s: npt.NDArray[np.bool_],
-    among: npt.NDArray[np.bool_],
 ) -> tuple[npt.NDArray[np.bool_], npt.NDArray[np.bool_]]:
     """Periodic rows beyond what the device sent, and the rows counted.
 
@@ -280,26 +306,27 @@ def _beyond_device_count(
     uptime the heartbeats differ by, rounded up. While a backlog is caught up, rows are processed
     out of that order, so an interval's count stays usable until LATE_US after the next heartbeat
     that arrived live: no later against the device clock than the least delayed one since the
-    device booted, give or take LATE_US. Rows of `keep` always stay; the others fill the count,
-    those not repeating a delivery 30 s before first, then the earliest. Only rows of `among`
-    count.
+    device booted, give or take LATE_US. The earliest row of each payload per day always stays;
+    the others fill the count, those not repeating a delivery 30 s before first, then the
+    earliest. Identical rows don't count.
     """
     surplus = np.zeros(len(d.time_us), np.bool_)
     counted = np.zeros(len(d.time_us), np.bool_)
     if rules.heartbeat not in d.subjects:
         return surplus, counted
-    beats = np.flatnonzero(_rows_of(d, [rules.heartbeat]) & _earliest(d, per_day=False))
+    beats = np.flatnonzero(_rows_of(d, [rules.heartbeat]) & payloads.first_in_month)
     beats = beats[np.argsort(d.time_us[beats], kind="stable")]
-    at, uptime = d.time_us[beats], d.uptime[beats]
+    at, uptime = d.time_us[beats], d.uptime[beats].astype(np.int64)
     usable = (uptime[1:] > uptime[:-1]) & (at[:-1] >= WINDOW_START_US) & (at[1:] < WINDOW_END_US)
     allowed = (uptime[1:] - uptime[:-1] + PERIOD_S - 1) // PERIOD_S  # rounded up
     usable_until = _until_next_live(at, uptime)
     interval = np.searchsorted(at, d.time_us, side="right") - 1
     inside = (interval >= 0) & (interval < len(usable))
     inside[inside] = usable[interval[inside]]
+    keep = payloads.first_in_day
 
     for subject in _subject_ids(d, rules.periodic):
-        rows = np.flatnonzero((d.subject == subject) & inside & among)
+        rows = np.flatnonzero((d.subject == subject) & inside & ~payloads.identical)
         rows = rows[np.lexsort((d.time_us[rows], repeats_30_s[rows], ~keep[rows], interval[rows]))]
         counted[rows] = True
         starts = np.searchsorted(interval[rows], np.arange(len(usable) + 1))
@@ -342,21 +369,21 @@ def classify(d: Deliveries, rules: Rules) -> npt.NDArray[np.int8]:
     window = (d.time_us >= WINDOW_START_US) & (d.time_us < WINDOW_END_US)
     unique = _rows_of(d, rules.unique)
     periodic = _rows_of(d, rules.periodic)
-    identical = _identical_to_earlier(d)
+    payloads = _payloads(d)
+    identical = payloads.identical
     # A row written twice may be one delivery, so its twin vouches for no redelivery of its own.
     deliveries = window & ~identical
     # Each periodic row repeating a delivery 30 s before, proven or not, only to order them.
     repeats_30_s = _after_30_s(
         d, np.flatnonzero(deliveries & periodic), np.full(len(d.time_us), np.iinfo(np.int64).max)
     )
-    surplus, counted = _beyond_device_count(
-        d, rules, _earliest(d, per_day=True), repeats_30_s, ~identical
-    )
-    collecting = np.maximum(_block_open_until(d), _probe_open_until(d, unique))
+    surplus, counted = _beyond_device_count(d, rules, payloads, repeats_30_s)
+    collecting = _block_open_until(d)
+    np.maximum(collecting, _probe_open_until(d, unique, payloads.last_at), out=collecting)
     proven = _after_30_s(d, np.flatnonzero(deliveries & ~unique), collecting)
     reasons = np.select(
         [
-            unique & ~_earliest(d, per_day=False),
+            unique & ~payloads.first_in_month,
             identical,
             surplus,
             proven & ~counted & ~unique,
@@ -365,6 +392,23 @@ def classify(d: Deliveries, rules: Rules) -> npt.NDArray[np.int8]:
         Reason.KEPT,
     )
     return np.where(window, reasons, Reason.KEPT).astype(np.int8)
+
+
+def payloads_lost(d: Deliveries, keep: npt.NDArray[np.bool_]) -> int:
+    """How many payloads of a subject on a UTC day keep no row that day or the day before.
+
+    A copy is delivered within minutes of its original, so one past midnight may go.
+    """
+    day = d.time_us // DAY_US
+    order = np.lexsort((day, d.content[:, 1], d.content[:, 0], d.subject))
+    same = _same_as_previous(order, [d.subject, d.content[:, 0], d.content[:, 1]])
+    day = day[order]
+    starts = np.flatnonzero(np.concatenate([[True], ~(same & (day[1:] == day[:-1]))]))
+    kept = np.logical_or.reduceat(keep[order], starts)
+    day = day[starts]
+    covered = kept.copy()
+    covered[1:] |= same[starts[1:] - 1] & kept[:-1] & (day[1:] == day[:-1] + 1)
+    return int(np.count_nonzero(~covered))
 
 
 def tally(d: Deliveries, reasons: npt.NDArray[np.int8]) -> list[dict[str, str | int]]:

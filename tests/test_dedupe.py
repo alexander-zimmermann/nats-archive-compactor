@@ -4,11 +4,14 @@ import datetime as dt
 import json
 from collections.abc import Iterator
 
+import numpy as np
+import numpy.typing as npt
 import pyarrow as pa
 import pytest
 from botocore.exceptions import ClientError
 
 import nats_archive_compactor.__main__ as compactor
+from nats_archive_compactor import redelivery
 from nats_archive_compactor.__main__ import _dedupe, _rollup
 
 from .support import Store
@@ -176,7 +179,7 @@ def test_the_switch_dedupes_only_the_named_streams_and_nothing_else(
 def test_the_switch_without_named_streams_touches_nothing(
     store: Store, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Discovery would include ems_esp and warp_*, whose May needs more than exact repeats."""
+    """Deduplication rewrites whole months, so discovering every stream is no target."""
     _rolled_up_month(store, "knx", {"02": [A, A]})
     seeded = store.keys()
     monkeypatch.setenv("COMPACT_DEDUPE_MONTH", "2026/05")
@@ -261,18 +264,147 @@ def test_a_dry_run_counts_the_copies_of_a_stream_stamped_at_delivery(
     ]
 
 
-def test_a_stream_stamped_at_delivery_is_only_counted_yet(
+RTC = "warp.rtc.time"
+TICK_1: Row = ("2026-05-10T10:00:00Z", RTC, '{"time": 1}')
+TICK_2: Row = ("2026-05-10T10:00:10Z", RTC, '{"time": 2}')
+TICK_1_AGAIN: Row = ("2026-05-10T10:00:30Z", RTC, '{"time": 1}')
+TICK_2_AGAIN: Row = ("2026-05-10T10:00:40Z", RTC, '{"time": 2}')
+# After the redelivery window a repeat is genuine, whatever the subject promises.
+TICK_3: Row = ("2026-05-28T08:00:00Z", RTC, '{"time": 3}')
+TICK_3_AGAIN: Row = ("2026-05-28T08:00:30Z", RTC, '{"time": 3}')
+CLOCK_MONTH = {"10": [TICK_1, TICK_2, TICK_1_AGAIN, TICK_2_AGAIN], "28": [TICK_3, TICK_3_AGAIN]}
+
+
+def test_a_stream_stamped_at_delivery_loses_its_proven_copies(store: Store) -> None:
+    """A clock never repeats, so within the window a repeat goes; the original stays beside."""
+    original = _rolled_up_month(store, "warp_system", CLOCK_MONTH)
+
+    assert _dedupe(store.client, "warp_system", "2026/05") == "deduped"
+
+    monthly = "warp_system/2026/05/monthly.parquet"
+    assert store.keys() == [monthly, f"{monthly}.orig"]
+    assert _rows(store.table(monthly)) == [TICK_1, TICK_2, TICK_3, TICK_3_AGAIN]
+    assert compactor._recorded_days(compactor._footer(store.client, monthly)) == {
+        "10": 2,
+        "28": 2,
+    }
+    assert store.table(f"{monthly}.orig").equals(original)
+
+
+def _classify_also(monkeypatch: pytest.MonkeyPatch, rows: list[int]) -> None:
+    """Make the classification drop these rows as well, indexed from 0 in file order."""
+    classify = redelivery.classify
+
+    def classify_also(d: redelivery.Deliveries, rules: redelivery.Rules) -> npt.NDArray[np.int8]:
+        reasons = classify(d, rules)
+        reasons[rows] = redelivery.Reason.AFTER_30_S
+        return reasons
+
+    monkeypatch.setattr(redelivery, "classify", classify_also)
+
+
+def test_a_rewrite_losing_a_payload_writes_nothing(
     store: Store, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Rewriting its month needs a check of its own; until then only a dry run touches it."""
-    _rolled_up_month(store, "ems_esp", {"10": _ems_minute()})
-    seeded = store.keys()
-    _switch(monkeypatch, "ems_esp", dry_run=False)
+    """Every payload a subject sent keeps a row, whatever the rules say."""
+    original = _rolled_up_month(store, "warp_system", CLOCK_MONTH)
+    _classify_also(monkeypatch, [1])  # TICK_2, whose repeat goes anyway
 
-    with pytest.raises(SystemExit):
-        compactor.main()
+    with pytest.raises(RuntimeError, match="1 payloads"):
+        _dedupe(store.client, "warp_system", "2026/05")
 
-    assert store.keys() == seeded
+    monthly = "warp_system/2026/05/monthly.parquet"
+    assert store.keys() == [monthly, f"{monthly}.orig"]
+    assert store.table(monthly).equals(original)
+
+
+def test_a_repeat_days_later_is_no_copy_to_drop(store: Store) -> None:
+    """A clock repeating two days on is no redelivery; the month stays as it was."""
+    later = ("2026-05-12T10:00:00Z", *TICK_1[1:])
+    original = _rolled_up_month(store, "warp_system", {"10": [TICK_1], "12": [later]})
+
+    with pytest.raises(RuntimeError, match="1 payloads"):
+        _dedupe(store.client, "warp_system", "2026/05")
+
+    monthly = "warp_system/2026/05/monthly.parquet"
+    assert store.keys() == [monthly, f"{monthly}.orig"]
+    assert store.table(monthly).equals(original)
+
+
+def test_a_copy_past_midnight_goes(store: Store) -> None:
+    """Its original was delivered the day before."""
+    late = ("2026-05-10T23:59:50Z", RTC, '{"time": 9}')
+    copy = ("2026-05-11T00:00:20Z", RTC, '{"time": 9}')
+    _rolled_up_month(store, "warp_system", {"10": [late], "11": [copy]})
+
+    assert _dedupe(store.client, "warp_system", "2026/05") == "deduped"
+
+    assert _rows(store.table("warp_system/2026/05/monthly.parquet")) == [late]
+
+
+def test_a_rewrite_dropping_a_row_outside_the_window_never_replaces_the_monthly_file(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = _rolled_up_month(store, "warp_system", CLOCK_MONTH)
+    _classify_also(monkeypatch, [5])  # TICK_3_AGAIN
+
+    with pytest.raises(RuntimeError, match="row 6 of the original lies outside"):
+        _dedupe(store.client, "warp_system", "2026/05")
+
+    monthly = "warp_system/2026/05/monthly.parquet"
+    assert store.keys() == [monthly, f"{monthly}.orig"]
+    assert store.table(monthly).equals(original)
+
+
+def test_a_rewrite_other_than_the_rows_kept_never_replaces_the_monthly_file(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The new file is checked against the classification, not trusted."""
+    original = _rolled_up_month(store, "warp_system", CLOCK_MONTH)
+    kept_batches = compactor._kept_batches
+
+    def kept_batches_losing_28(
+        batches: Iterator[tuple[str, pa.RecordBatch]], keep: npt.NDArray[np.bool_]
+    ) -> Iterator[tuple[str, pa.RecordBatch]]:
+        for day, batch in kept_batches(batches, keep):
+            yield day, batch.slice(0, 0) if day == "28" else batch
+
+    monkeypatch.setattr(compactor, "_kept_batches", kept_batches_losing_28)
+
+    with pytest.raises(RuntimeError, match="row 5 of the original is missing"):
+        _dedupe(store.client, "warp_system", "2026/05")
+
+    monthly = "warp_system/2026/05/monthly.parquet"
+    assert store.keys() == [monthly, f"{monthly}.orig"]
+    assert store.table(monthly).equals(original)
+
+
+def test_the_switch_rewrites_a_stream_stamped_at_delivery_as_its_dry_run_counted(
+    store: Store, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The rewrite logs the dry run's lines, and the nightly run afterwards leaves it alone."""
+    _rolled_up_month(store, "warp_system", CLOCK_MONTH)
+    _switch(monkeypatch, "warp_system", dry_run=True)
+    compactor.main()
+    counted = _day_lines(capsys.readouterr().out)
+    monkeypatch.delenv("COMPACT_DEDUPE_DRY_RUN")
+
+    compactor.main()
+
+    assert _day_lines(capsys.readouterr().out) == counted
+    assert counted == [
+        ("2026-05-10", RTC, 4, 2),
+        ("2026-05-28", RTC, 2, 2),
+    ]
+    rewritten = store.keys()
+    for name in ("COMPACT_STREAMS", "COMPACT_DEDUPE_MONTH"):
+        monkeypatch.delenv(name)
+    monkeypatch.setenv("COMPACT_BACKFILL_DAYS", "5")
+    monkeypatch.setenv("COMPACT_ROLLUP_MONTHS", "1")
+
+    compactor.main()
+
+    assert store.keys() == rewritten
 
 
 def test_a_dry_run_counts_the_original_once_a_rewrite_replaced_it(
