@@ -16,7 +16,7 @@ classifiers = [
     "Topic :: System :: Archiving",
 ]
 dependencies = [
-    "boto3>=1.43.121",
+    "boto3>=1.43.122",
     "numpy>=2.5.4",
     "pyarrow>=26.0.0",
     "structlog>=26.1.0",
@@ -29,7 +29,7 @@ dev = [
     "mypy>=2.4.1",
     "pre-commit>=4.7.0",
     "testcontainers>=4.15.0",
-    "boto3-stubs[s3]>=1.43.121",
+    "boto3-stubs[s3]>=1.43.122",
 ]
 
 [project.scripts]
