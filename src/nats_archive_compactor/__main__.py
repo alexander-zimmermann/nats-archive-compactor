@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import contextlib
 import datetime as dt
-import hashlib
 import io
 import json
 import os
@@ -15,16 +13,11 @@ from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
 import boto3
-import numpy as np
-import numpy.typing as npt
 import pyarrow as pa
-import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import structlog
 from botocore.config import Config
 from botocore.exceptions import ClientError
-
-from nats_archive_compactor import redelivery
 
 if TYPE_CHECKING:
     from mypy_boto3_s3 import S3Client
@@ -37,17 +30,6 @@ RETRY_ATTEMPTS = 3
 DELETE_BATCH = 1000  # the most keys one DeleteObjects call takes
 DAILY_ROWS = b"daily_rows"  # monthly.parquet metadata: rows taken from each day
 ROLLUP_BATCH_ROWS = 16_384  # rows read and written at a time, so a day of any size fits in memory
-MONTHLY_BACKUP = "monthly.parquet.orig"  # a deduplicated month's file as it was before
-MONTHLY_REWRITE = "monthly.parquet.new"  # a deduplicated month's file until it is verified
-ARCHIVE_COLUMNS = ("payload", "subject", "time")  # the column order the archive writes today
-ROW_FIELDS = ("time", "subject", "payload")  # what makes rows identical
-# The file days of the window in which NATS redelivered every message after 30 s.
-REDELIVERY_DAYS = tuple(
-    dt.datetime.fromtimestamp(us / 1e6, dt.UTC).strftime("%Y/%m/%d")
-    for us in (redelivery.WINDOW_START_US, redelivery.WINDOW_END_US)
-)
-FILE_BUFFER_BYTES = 1 << 20  # read buffer for a local Parquet file
-
 _HOUR_FILE = re.compile(r"\d{2}/[^/]+\.parquet")
 _DAILY_FILE = re.compile(r"(\d{2})/daily\.parquet")
 
@@ -200,11 +182,6 @@ def _write_daily(client: S3Client, table: pa.Table, key: str) -> None:
         client.upload_file(tmp.name, BUCKET, key)
 
 
-def _copy(client: S3Client, source: str, key: str) -> None:
-    """Copy one object to `key` inside the bucket, without downloading it."""
-    client.copy_object(Bucket=BUCKET, Key=key, CopySource={"Bucket": BUCKET, "Key": source})
-
-
 def _delete_keys(client: S3Client, keys: list[str]) -> None:
     """Delete exactly these keys and nothing else; a key already gone counts as deleted."""
     for start in range(0, len(keys), DELETE_BATCH):
@@ -333,316 +310,6 @@ def _rollup(client: S3Client, stream: str, month: str) -> str:
     return "rolled-up"
 
 
-@contextlib.contextmanager
-def _downloaded(client: S3Client, key: str) -> Iterator[str]:
-    """The object in a temporary local file, so it is read from disk rather than held in memory."""
-    with tempfile.NamedTemporaryFile(suffix=".parquet") as tmp:
-        client.download_file(BUCKET, key, tmp.name)
-        yield tmp.name
-
-
-def _day_batches(path: str, days: dict[str, int]) -> Iterator[tuple[str, pa.RecordBatch]]:
-    """A local monthly file's rows in batches, each cut to lie within one of its recorded days.
-
-    Without pre-buffering, pyarrow reads one batch at a time instead of the whole file.
-    """
-    reader = pq.ParquetFile(path, pre_buffer=False, buffer_size=FILE_BUFFER_BYTES)
-    bounds = iter(days.items())
-    day, left = "", 0
-    for batch in reader.iter_batches(batch_size=ROLLUP_BATCH_ROWS):
-        while batch.num_rows:
-            while not left:
-                day, left = next(bounds, ("", -1))
-            if left < 0:
-                raise RuntimeError(f"{path} holds more rows than it records")
-            piece = batch.slice(0, left)
-            yield day, piece
-            left -= piece.num_rows
-            batch = batch.slice(piece.num_rows)
-
-
-def _batch_digests(batch: pa.RecordBatch) -> list[bytes]:
-    """Each row's identity, hashed from the repr of its values, so any column type compares."""
-    columns = (batch.column(name).to_pylist() for name in ROW_FIELDS)
-    return [
-        hashlib.blake2b(repr(row).encode(), digest_size=16).digest()
-        for row in zip(*columns, strict=True)
-    ]
-
-
-def _day_digests(path: str, days: dict[str, int]) -> Iterator[tuple[str, bytes]]:
-    """Each row of a local monthly file with its recorded day and identity, in file order."""
-    for day, batch in _day_batches(path, days):
-        for digest in _batch_digests(batch):
-            yield day, digest
-
-
-def _day_after(day: str, before: str | None) -> bool:
-    """Whether `day` directly follows `before` within the month."""
-    return before is not None and int(day) == int(before) + 1
-
-
-def _redelivered(month: str, day: str) -> bool:
-    """Whether the day of the month is one with copies to drop."""
-    return REDELIVERY_DAYS[0] <= f"{month}/{day}" <= REDELIVERY_DAYS[1]
-
-
-def _first_rows(
-    batches: Iterator[tuple[str, pa.RecordBatch]], month: str
-) -> Iterator[tuple[str, pa.RecordBatch]]:
-    """The batches without rows identical to one already seen on the same or the previous day.
-
-    Only the redelivery days lose rows. A message and its copies are written within a day of
-    each other, so two days of rows bound the memory; a repeat further apart would stay.
-    """
-    previous: set[bytes] = set()
-    current: set[bytes] = set()
-    current_day = None
-    for day, batch in batches:
-        if day != current_day:
-            previous = current if _day_after(day, current_day) else set()
-            current, current_day = set(), day
-        if not _redelivered(month, day):
-            yield day, batch
-            continue
-        keep = []
-        for digest in _batch_digests(batch):
-            first = digest not in current and digest not in previous
-            if first:
-                current.add(digest)
-            keep.append(first)
-        yield day, batch.filter(pa.array(keep, pa.bool_()))
-
-
-def _kept_batches(
-    batches: Iterator[tuple[str, pa.RecordBatch]], keep: npt.NDArray[np.bool_]
-) -> Iterator[tuple[str, pa.RecordBatch]]:
-    """The batches, which run through the file in order, cut to the rows `keep` marks."""
-    start = 0
-    for day, batch in batches:
-        yield day, batch.filter(pa.array(keep[start : start + batch.num_rows]))
-        start += batch.num_rows
-
-
-def _write_batches(
-    client: S3Client,
-    source: str,
-    pieces: Iterator[tuple[str, pa.RecordBatch]],
-    days: dict[str, int],
-    key: str,
-) -> dict[str, int]:
-    """Upload the pieces of the local monthly file to `key`; return each day's rows.
-
-    The columns come out in the order the archive writes today.
-    """
-    source_schema = pq.read_schema(source)
-    schema = pa.schema([source_schema.field(name) for name in ARCHIVE_COLUMNS])
-    kept = dict.fromkeys(days, 0)
-    with tempfile.NamedTemporaryFile(suffix=".parquet") as tmp:
-        with pq.ParquetWriter(tmp.name, schema, compression="zstd") as writer:
-            for day, batch in pieces:
-                if batch.num_rows:
-                    writer.write_batch(_conform(batch, schema))
-                    kept[day] += batch.num_rows
-            writer.add_key_value_metadata({DAILY_ROWS: json.dumps(kept)})
-        client.upload_file(tmp.name, BUCKET, key)
-    return kept
-
-
-def _verify_deduped(
-    source: str, written: str, month: str, days: dict[str, int], kept: dict[str, int]
-) -> None:
-    """Raise unless the written file holds the source's rows in order, less only repeats.
-
-    A row may be left out only on a redelivery day and only beside an identical row kept on
-    the same or the previous day.
-    """
-    _check_rewrite_footer(written, kept)
-    for day, rows in days.items():
-        if not _redelivered(month, day) and kept[day] != rows:
-            raise RuntimeError(f"day {day} has {kept[day]} rows, the original {rows}")
-
-    output = _day_digests(written, kept)
-    ahead = next(output, None)
-    previous: set[bytes] = set()
-    current: set[bytes] = set()
-    current_day = None
-    number = 0
-    for day, batch in _day_batches(source, days):
-        if day != current_day:
-            previous = current if _day_after(day, current_day) else set()
-            current, current_day = set(), day
-        for digest in _batch_digests(batch):
-            number += 1
-            if ahead == (day, digest):
-                current.add(digest)
-                ahead = next(output, None)
-            elif digest not in current and digest not in previous:
-                raise RuntimeError(f"row {number} of the original is missing from the rewrite")
-    if ahead is not None:
-        raise RuntimeError("the rewrite holds rows the original does not")
-
-
-def _check_rewrite_footer(written: str, kept: dict[str, int]) -> None:
-    """Raise unless the written file records the rows kept and has the archive's columns."""
-    footer = pq.read_metadata(written)
-    if _recorded_days(footer) != kept or footer.num_rows != sum(kept.values()):
-        raise RuntimeError(f"rewrite holds {footer.num_rows} rows, recorded {kept}")
-    names = footer.schema.to_arrow_schema().names
-    if tuple(names) != ARCHIVE_COLUMNS:
-        raise RuntimeError(f"rewrite has columns {names}")
-
-
-def _times_us(batch: pa.RecordBatch) -> npt.NDArray[np.int64]:
-    """Each row's time in microseconds since the epoch."""
-    stamped = pc.cast(batch.column("time"), pa.timestamp("us", tz="UTC"))
-    return np.asarray(stamped.cast(pa.int64()).to_numpy(), np.int64)
-
-
-def _verify_kept(
-    source: str,
-    written: str,
-    days: dict[str, int],
-    keep: npt.NDArray[np.bool_],
-    kept: dict[str, int],
-) -> None:
-    """Raise unless the written file holds exactly the source's rows `keep` marks, in order.
-
-    A row may be left out only inside the redelivery window.
-    """
-    _check_rewrite_footer(written, kept)
-    output = _day_digests(written, kept)
-    number = 0
-    for day, batch in _day_batches(source, days):
-        stays = keep[number : number + batch.num_rows]
-        times = _times_us(batch)
-        outside = (times < redelivery.WINDOW_START_US) | (times >= redelivery.WINDOW_END_US)
-        for digest, kept_row, out in zip(
-            _batch_digests(batch), stays.tolist(), outside.tolist(), strict=True
-        ):
-            number += 1
-            if kept_row and next(output, None) != (day, digest):
-                raise RuntimeError(f"row {number} of the original is missing from the rewrite")
-            if not kept_row and out:
-                raise RuntimeError(f"row {number} of the original lies outside the window")
-    if number != len(keep) or next(output, None) is not None:
-        raise RuntimeError("the rewrite holds rows the original does not")
-
-
-def _day_subjects(batch: pa.RecordBatch) -> Iterator[tuple[str, str]]:
-    """Each row's UTC day of its time, and its subject."""
-    stamped = pc.cast(batch.column("time"), pa.timestamp("us", tz="UTC"))
-    days = pc.strftime(stamped, format="%Y-%m-%d").to_pylist()
-    return zip(days, batch.column("subject").to_pylist(), strict=True)
-
-
-def _count_exact(source: str, month: str) -> list[dict[str, str | int]]:
-    """Per UTC day of the row time and subject: rows, and rows identical to one kept."""
-    rows: Counter[tuple[str, str]] = Counter()
-    kept: Counter[tuple[str, str]] = Counter()
-
-    def counted(
-        pieces: Iterator[tuple[str, pa.RecordBatch]],
-    ) -> Iterator[tuple[str, pa.RecordBatch]]:
-        for day, batch in pieces:
-            rows.update(_day_subjects(batch))
-            yield day, batch
-
-    days = _recorded_days(pq.read_metadata(source))
-    for _, first in _first_rows(counted(_day_batches(source, days)), month):
-        kept.update(_day_subjects(first))
-    report: list[dict[str, str | int]] = []
-    for (day, subject), n in sorted(rows.items()):
-        k = kept[(day, subject)]
-        report.append({"day": day, "subject": subject, "rows": n, "kept": k, "identical": n - k})
-    return report
-
-
-def _classified(source: str, stream: str) -> tuple[redelivery.Deliveries, npt.NDArray[np.int8]]:
-    """The local monthly file's deliveries and why each row goes, by the stream's rules."""
-    rules = redelivery.RULES[stream]
-    reader = pq.ParquetFile(source, pre_buffer=False, buffer_size=FILE_BUFFER_BYTES)
-    batches = reader.iter_batches(batch_size=ROLLUP_BATCH_ROWS)
-    deliveries = redelivery.Deliveries.from_batches(
-        batches, reader.metadata.num_rows, rules.heartbeat
-    )
-    return deliveries, redelivery.classify(deliveries, rules)
-
-
-def _log_day_lines(stream: str, month: str, lines: list[dict[str, str | int]]) -> None:
-    """Log one compaction.dedupe.day line per UTC day and subject."""
-    for line in lines:
-        log.info("compaction.dedupe.day", stream=stream, month=month, **line)
-
-
-def _rows_kept(source: str, stream: str, month: str) -> npt.NDArray[np.bool_]:
-    """Which rows of the local monthly file are no proven copy; logs the dry run's lines.
-
-    Each payload of a subject must keep a row, or nothing is written.
-    """
-    deliveries, reasons = _classified(source, stream)
-    _log_day_lines(stream, month, redelivery.tally(deliveries, reasons))
-    keep: npt.NDArray[np.bool_] = reasons == redelivery.Reason.KEPT
-    lost = redelivery.payloads_lost(deliveries, keep)
-    if lost:
-        raise RuntimeError(f"{lost} payloads would lose every row")
-    return keep
-
-
-def _count(client: S3Client, stream: str, month: str) -> str:
-    """Log per day and subject what deduplicating the month would drop; write nothing."""
-    prefix = f"{stream}/{month}/"
-    backup = f"{prefix}{MONTHLY_BACKUP}"
-    # The source a rewrite reads: the original once a rewrite replaced it.
-    source_key = backup if _exists(client, backup) else f"{prefix}monthly.parquet"
-    with _downloaded(client, source_key) as source:
-        if stream in redelivery.RULES:
-            lines = redelivery.tally(*_classified(source, stream))
-        else:
-            lines = _count_exact(source, month)
-    _log_day_lines(stream, month, lines)
-    return "counted"
-
-
-def _dedupe(client: S3Client, stream: str, month: str) -> str:
-    """Rewrite the month's monthly file without copies; the original stays beside it."""
-    prefix = f"{stream}/{month}/"
-    monthly = f"{prefix}monthly.parquet"
-    backup = f"{prefix}{MONTHLY_BACKUP}"
-    rewrite = f"{prefix}{MONTHLY_REWRITE}"
-    if not _exists(client, backup):
-        _copy(client, monthly, backup)
-    with _downloaded(client, backup) as source:
-        days = _recorded_days(pq.read_metadata(source))
-        # The streams stamped at delivery drop what the rules prove; the others exact repeats.
-        keep = _rows_kept(source, stream, month) if stream in redelivery.RULES else None
-        try:
-            if keep is not None:
-                pieces = _kept_batches(_day_batches(source, days), keep)
-            else:
-                pieces = _first_rows(_day_batches(source, days), month)
-            kept = _write_batches(client, source, pieces, days, rewrite)
-            with _downloaded(client, rewrite) as written:
-                if keep is not None:
-                    _verify_kept(source, written, days, keep, kept)
-                else:
-                    _verify_deduped(source, written, month, days, kept)
-        except Exception:
-            # An unverified rewrite never replaces the monthly file.
-            _delete_keys(client, [rewrite])
-            raise
-    _copy(client, rewrite, monthly)
-    _delete_keys(client, [rewrite])
-    log.info(
-        "compaction.dedupe",
-        stream=stream,
-        month=month,
-        rows=sum(days.values()),
-        kept=sum(kept.values()),
-    )
-    return "deduped"
-
-
 def _targets(client: S3Client, stream: str, day: str, today: str, backfill: int) -> list[str]:
     """The days to compact for this stream: the single day, or a bounded backfill."""
     if backfill <= 0:
@@ -663,25 +330,11 @@ def main() -> None:
     today = now.strftime("%Y/%m/%d")
     explicit_day = os.environ.get("COMPACT_DAY")
     day = explicit_day or (now - dt.timedelta(days=1)).strftime("%Y/%m/%d")
-    dedupe_month = os.environ.get("COMPACT_DEDUPE_MONTH")
-    dry_run = os.environ.get("COMPACT_DEDUPE_DRY_RUN", "0").strip()
     # An explicit day names exactly one target, so backfill and rollup only apply without it.
     backfill = 0 if explicit_day else int(os.environ.get("COMPACT_BACKFILL_DAYS", "0"))
     rollup = 0 if explicit_day else int(os.environ.get("COMPACT_ROLLUP_MONTHS", "0"))
     # A month is rolled up once the month after it is over, i.e. when it is older than last month.
     last_month = _last_month(now)
-
-    # Deduplication rewrites whole months, so it runs only on the streams named.
-    if dedupe_month and not os.environ.get("COMPACT_STREAMS", "").strip():
-        log.error("compaction.start", error="COMPACT_DEDUPE_MONTH needs COMPACT_STREAMS")
-        sys.exit(1)
-    if dry_run not in ("0", "1"):
-        log.error("compaction.start", error="COMPACT_DEDUPE_DRY_RUN is 0 or 1")
-        sys.exit(1)
-    # Compaction and rollup write, so a dry run without a month to count is no dry run.
-    if dry_run == "1" and not dedupe_month:
-        log.error("compaction.start", error="COMPACT_DEDUPE_DRY_RUN needs COMPACT_DEDUPE_MONTH")
-        sys.exit(1)
 
     client = _build_client()
     streams = _resolve_streams(client)
@@ -690,8 +343,6 @@ def main() -> None:
         day=day,
         backfill_days=backfill,
         rollup_months=rollup,
-        dedupe_month=dedupe_month,
-        dry_run=dry_run == "1",
         streams=list(streams),
     )
 
@@ -717,11 +368,6 @@ def main() -> None:
         return status
 
     for stream in streams:
-        # Deduplicating a month is the run's only job.
-        if dedupe_month:
-            run(_count if dry_run == "1" else _dedupe, stream, "month", dedupe_month)
-            continue
-
         try:
             days = _targets(client, stream, day, today, backfill)
             months = _pending_months(client, stream, last_month) if rollup > 0 else []
@@ -741,11 +387,7 @@ def main() -> None:
             if run(_rollup, stream, "month", month) == "rolled-up":
                 rolled += 1
 
-    summary = (
-        {"month": dedupe_month, "deduped": statuses["deduped"], "counted": statuses["counted"]}
-        if dedupe_month
-        else {"day": day, "compacted": statuses["compacted"], "rolled_up": statuses["rolled-up"]}
-    )
+    summary = {"day": day, "compacted": statuses["compacted"], "rolled_up": statuses["rolled-up"]}
     if failed:
         log.warning("compaction.done", **summary, failed=failed)
         sys.exit(1)
