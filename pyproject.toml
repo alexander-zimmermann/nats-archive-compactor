@@ -17,7 +17,7 @@ classifiers = [
 ]
 dependencies = [
     "boto3>=1.43.123",
-    "pyarrow>=26.0.0",
+    "pyarrow>=26.0.1",
     "structlog>=26.1.0",
 ]
 
