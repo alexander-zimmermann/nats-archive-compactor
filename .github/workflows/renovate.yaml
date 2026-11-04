@@ -24,37 +24,15 @@ on:
         description: Renovate Version
         default: latest
 
-permissions:
-  contents: write
-  issues: write
-  pull-requests: write
-
 jobs:
   renovate:
-    name: Renovate
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-
-      - name: Generate Token
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
-        id: app-token
-        with:
-          # NOTE: 'app-id' is marked deprecated by the action, but GitHub's
-          # installation-token endpoint still rejects string client-id values
-          # with 'iss must be an Integer' (HTTP 401). Staying on numeric App ID.
-          app-id: ${{ secrets.RENOVATE_APP_ID }}
-          private-key: ${{ secrets.RENOVATE_PRIVATE_KEY }}
-
-      - name: Run Renovate
-        uses: renovatebot/github-action@1c0cf989c02653fba0efe7ca5772338860ca71dc # v46.3.12
-        env:
-          LOG_LEVEL: ${{ inputs.logLevel || 'debug' }}
-          RENOVATE_REPOSITORIES: ${{ github.repository }}
-          RENOVATE_DRY_RUN: ${{ inputs.dryRun }}
-          RENOVATE_PLATFORM: github
-          RENOVATE_PLATFORM_COMMIT: "true"
-        with:
-          token: ${{ steps.app-token.outputs.token }}
-          renovate-version: ${{ inputs.version || 'latest' }}
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    uses: alexander-zimmermann/lares/.github/workflows/sidecar-renovate.yaml@5888c5ee745e752d6a48f9587a9ffe34e373f14c # main
+    with:
+      dryRun: ${{ inputs.dryRun && 'full' || '' }}
+      logLevel: ${{ inputs.logLevel || 'debug' }}
+      version: ${{ inputs.version || 'latest' }}
+    secrets: inherit
