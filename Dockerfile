@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.28
+# syntax=docker/dockerfile:1.29
 FROM python:3.15-slim AS builder
 
 ENV PIP_NO_CACHE_DIR=1 \
