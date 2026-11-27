@@ -1,7 +1,7 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
-    "github>alexander-zimmermann/.github//.renovate/sidecarBase.json5#v1.0.1",
-    "github>alexander-zimmermann/.github//.renovate/sidecarPython.json5#v1.0.1",
+    "github>alexander-zimmermann/.github//.renovate/sidecarBase.json5#v1.0.2",
+    "github>alexander-zimmermann/.github//.renovate/sidecarPython.json5#v1.0.2",
   ],
 }
